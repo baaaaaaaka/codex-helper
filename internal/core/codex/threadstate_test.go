@@ -1,7 +1,12 @@
 package codex
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -64,4 +69,38 @@ func TestServerTracksThreadGoalSettingsAndTurn(t *testing.T) {
 	if i := s.Info(th.ID); i.Goal != nil {
 		t.Fatalf("after clear: %+v", i)
 	}
+}
+
+func TestApplyThreadSettingsRequiresNativeSnapshot(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := goalTestServer()
+		s.subs = make(map[string]map[int]func(Notification))
+		r, w := io.Pipe()
+		defer r.Close()
+		defer w.Close()
+		s.in = w
+		s.setSettings("thread", "old-model", nil, nil)
+		wire := make(chan error, 1)
+		go func() {
+			var request wireMsg
+			if err := json.NewDecoder(r).Decode(&request); err != nil {
+				wire <- err
+				return
+			}
+			if request.Method != "thread/settings/update" {
+				wire <- fmt.Errorf("unexpected method %s", request.Method)
+				return
+			}
+			s.handleLine([]byte(fmt.Sprintf(`{"id":%s,"result":{}}`, request.ID)))
+			wire <- nil
+		}()
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := s.ApplyThreadSettings(ctx, "thread", "new-model", "high"); err == nil {
+			t.Fatal("an acknowledged update without applied settings reported success")
+		}
+		if err := <-wire; err != nil {
+			t.Fatal(err)
+		}
+	})
 }

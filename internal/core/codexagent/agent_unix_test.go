@@ -229,23 +229,23 @@ func TestGoalInfoAndStopGoal(t *testing.T) {
 	if i := a.Info(2, thread); i != (engine.TurnInfo{}) {
 		t.Fatalf("info of a conversation without a server: %+v", i)
 	}
-	if g, err := a.Goal(ctx, 1, thread, home, engine.GoalState{}); err != nil || g.Status != "" {
+	if g, err := a.Goal(ctx, 1, thread, home); err != nil || g.Status != "" {
 		t.Fatalf("no goal: %+v %v", g, err)
 	}
-	if g, err := a.Goal(ctx, 1, thread, home, engine.GoalState{Objective: "Ship it", Status: engine.GoalActive}); err != nil || g.Status != engine.GoalActive {
+	if g, err := a.ActivateGoal(ctx, 1, thread, home, "Ship it", "", ""); err != nil || g.Status != engine.GoalActive {
 		t.Fatalf("set: %+v %v", g, err)
 	}
 	if i := a.Info(1, thread); !i.Goal.Active() || i.Goal.Objective != "Ship it" {
 		t.Fatalf("info with the goal: %+v", i)
 	}
-	res, err := a.StopGoal(ctx, 1, thread, home, "")
+	res, err := a.StopGoal(ctx, 1, thread, home, "", false)
 	if err != nil || !res.Paused || res.Interrupted || res.Objective != "Ship it" {
 		t.Fatalf("stop: %+v %v", res, err)
 	}
-	if g, err := a.Goal(ctx, 1, thread, home, engine.GoalState{}); err != nil || g.Status != engine.GoalPaused {
+	if g, err := a.Goal(ctx, 1, thread, home); err != nil || g.Status != engine.GoalPaused {
 		t.Fatalf("after stop: %+v %v", g, err)
 	}
-	if res, err := a.StopGoal(ctx, 1, thread, home, ""); err != nil || res.Paused {
+	if res, err := a.StopGoal(ctx, 1, thread, home, "", false); err != nil || res.Paused {
 		t.Fatalf("second stop: %+v %v", res, err)
 	}
 }

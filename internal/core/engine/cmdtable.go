@@ -49,7 +49,7 @@ var workCommands = map[string]cmdHandler{
 		e.cmdRetry(j, cs, firstLower(p.arg))
 	},
 	cmdCancelName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
-		e.cmdCancel(ctx, j, cs, firstLower(p.arg))
+		e.cmdCancel(ctx, j, cs, firstLower(p.arg), false)
 	},
 	cmdGoalName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
 		e.cmdGoal(ctx, j, cs, p.arg)

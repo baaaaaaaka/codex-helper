@@ -269,7 +269,7 @@ func TestGoalRecoveryDoesNotBlockOtherChatsOrRetargetNativeTurn(t *testing.T) {
 	}
 }
 
-func TestGoalUnknownDoesNotAuthorizeModelSwitch(t *testing.T) {
+func TestActiveGoalModelSwitchReadsNativeState(t *testing.T) {
 	r, ga := goalRig(t)
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "bind")
@@ -282,9 +282,52 @@ func TestGoalUnknownDoesNotAuthorizeModelSwitch(t *testing.T) {
 	ga.modelsHook = func(context.Context) ([]Model, error) { return switchModels, nil }
 	ga.gmu.Unlock()
 	r.ch.PostUser(work, "helper model use model-b")
-	r.wait("switch rejected on current goal", func() bool { return len(r.own(work, "independently continuing Codex goal")) > 0 })
+	r.wait("switch applied to active goal", func() bool { return len(r.own(work, "Codex applied these settings for the goal")) > 0 })
 	if !strings.Contains(strings.Join(ga.callLog(), "|"), "get") {
 		t.Fatal("switch used only the unknown cached state")
+	}
+	ga.gmu.Lock()
+	defer ga.gmu.Unlock()
+	if ga.settings.Model != "model-b" || ga.goals[th].Status != GoalActive || ga.goals[th].Objective != "work" {
+		t.Fatalf("switch changed the goal instead of its model: %+v, %+v", ga.settings, ga.goals[th])
+	}
+
+}
+
+func TestGoalModelSwitchFailureSavesSettingsForExplicitResume(t *testing.T) {
+	r, ga := goalRig(t)
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "bind")
+	r.waitIdle(work)
+	id := convID(t, r, "s001")
+	r.wait("bound", func() bool { return r.e.threadOf(id) != "" })
+	th := r.e.threadOf(id)
+	ga.gmu.Lock()
+	ga.modelsHook = func(context.Context) ([]Model, error) { return switchModels, nil }
+	ga.goals[th] = GoalState{Objective: "keep this goal", Status: GoalActive}
+	ga.goalHook = func(context.Context, GoalState) error {
+		ga.gmu.Lock()
+		ga.goals[th] = GoalState{Objective: "keep this goal", Status: GoalPaused}
+		ga.gmu.Unlock()
+		return errors.New("native settings were not confirmed")
+	}
+	ga.gmu.Unlock()
+
+	r.ch.PostUser(work, "helper model use model-b low")
+	r.wait("saved with unconfirmed switch", func() bool {
+		return len(r.own(work, "Settings saved. Codex did not confirm the goal switch")) == 1
+	})
+	ga.gmu.Lock()
+	ga.goalHook = nil
+	ga.gmu.Unlock()
+
+	r.ch.PostUser(work, "helper goal active")
+	r.wait("explicit resume", func() bool { return len(r.own(work, "Goal active again.")) == 1 })
+	ga.gmu.Lock()
+	defer ga.gmu.Unlock()
+	if ga.goals[th].Status != GoalActive || ga.goals[th].Objective != "keep this goal" ||
+		ga.settings.Model != "model-b" || ga.settings.Effort != "low" {
+		t.Fatalf("resume lost goal or settings: %+v %+v", ga.goals[th], ga.settings)
 	}
 }
 

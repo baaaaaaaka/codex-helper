@@ -129,7 +129,8 @@ Work chat commands:
 - `helper status`: session status.
 - `helper fork`: copy this session into a new work chat (also while a request runs; the copy stops at the last finished request), then post the new chat's link.
 - `helper model`, `helper model list`, `helper model <model> [effort]`, `helper model use <model> [effort]`, `helper model reset`: show or switch this session's model.
-- `helper effort <effort>`: switch this session's reasoning effort. Model/effort changes interrupt helper-owned active work, then continue on the same Codex thread with the latest valid settings. Pending current-task input takes priority over an internal continuation. Completed or cancelled tasks stay stopped. An unknown outcome pauses the chat; attached TUI/external execution and active native goals are outside this switch contract.
+- `helper effort <effort>`: switch this session's reasoning effort. Model/effort changes interrupt helper-owned active work, then continue on the same Codex thread with the latest valid settings. Pending current-task input takes priority over an internal continuation. Completed or cancelled tasks stay stopped. An unknown outcome pauses the chat. For an active native goal, Codex stops its current autonomous turn, applies the new settings, and resumes the same goal. An ordinary request already running in that thread can finish on its original model. Close an attached TUI before changing model settings.
+- `helper goal active` applies the chat's model settings and resumes the goal. `helper goal pause` pauses the goal and interrupts the current turn. The goal and its progress are retained.
 - `helper stats`: requests and token usage of this session.
 - `helper skills`: skill subscriptions.
 - `helper file <relative-path>` / `!file <relative-path>`: send one file from the Teams outbound root (the bare command shows the root).

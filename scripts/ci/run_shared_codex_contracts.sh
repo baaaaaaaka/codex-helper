@@ -25,7 +25,7 @@ CGO_ENABLED=0 go build -o "$contract_scratch/cxp" ./cmd/codex-proxy
 "$contract_scratch/probe" -test.list '^TestRealCodexAAASharedTUI$' | grep -qx TestRealCodexAAASharedTUI
 "$contract_scratch/probe" -test.list '^TestRealCodexGatewayRecoveryTUI$' | grep -qx TestRealCodexGatewayRecoveryTUI
 "$contract_scratch/agent" -test.list '^TestRealCodexSharedTUIThreadBinding$' | grep -qx TestRealCodexSharedTUIThreadBinding
-for critical_test in TestRealCodexGoalDisabledStop TestRealCodexGoalReadDoesNotLoadExecution; do
+for critical_test in TestRealCodexGoalDisabledStop TestRealCodexGoalReadDoesNotLoadExecution TestRealCodexGoalSwitchAndPause; do
  "$contract_scratch/agent" -test.list "^${critical_test}$" | grep -qx "$critical_test"
 done
 for critical_test in TestRealCodexSharedModelSwitch TestRealCodexSharedSwitchInputBoundary TestRealCodexGoalReadWithoutResume; do
@@ -47,7 +47,7 @@ for critical_test in TestRealCodexSharedModelSwitch TestRealCodexSharedSwitchInp
   exit 1
  fi
 done
-for critical_test in TestRealCodexGoalDisabledStop TestRealCodexGoalReadDoesNotLoadExecution; do
+for critical_test in TestRealCodexGoalDisabledStop TestRealCodexGoalReadDoesNotLoadExecution TestRealCodexGoalSwitchAndPause; do
  if ! grep -Eq "^--- PASS: ${critical_test}( |$)" "$contract_scratch/agent.log"; then
   echo "Goal adapter contract did not pass or was skipped: $critical_test" >&2
   exit 1

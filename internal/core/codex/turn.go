@@ -402,17 +402,8 @@ func (s *Server) submitTurn(ctx context.Context, p TurnStartParams, dispatched <
 		return s.TurnStart(ctx, p)
 	}
 	// The queue uses the current session settings, as does native TUI Tab.
-	settings := map[string]any{"threadId": p.ThreadID}
-	if p.Model != "" {
-		settings["model"] = p.Model
-	}
-	if p.Effort != "" {
-		settings["effort"] = p.Effort
-	}
-	if len(settings) > 1 {
-		if err := s.Call(ctx, "thread/settings/update", settings, nil); err != nil {
-			return "", &ErrNotStarted{Err: err}
-		}
+	if err := s.UpdateThreadSettings(ctx, p.ThreadID, p.Model, p.Effort); err != nil {
+		return "", &ErrNotStarted{Err: err}
 	}
 	id, err := s.QueueAdd(ctx, p)
 	if err != nil {

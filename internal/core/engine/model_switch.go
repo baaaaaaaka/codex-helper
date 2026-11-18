@@ -60,13 +60,13 @@ func pendingSettings(tx *store.Tx, conv int64, control bool) (bool, error) {
 }
 
 func (e *Engine) applyModelEffort(ctx context.Context, j cmdJob, c modelChat, model, modelSrc, effort, effortSrc, text string) {
+	ga, hasGoals := e.ag.(GoalAgent)
 	info := e.turnInfo(c.cs.id)
-	goalActive := info.Goal.Active()
-	if ga, ok := e.ag.(GoalAgent); ok && c.th.ThreadID != "" {
-		// A cold or stale observation cannot authorize a model handoff through an
-		// independently active native goal. Read without resuming execution.
+	goalActive := false
+	if hasGoals && c.th.ThreadID != "" {
+		// Read native state without starting a cold goal on the old settings.
 		gctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		g, err := ga.Goal(gctx, c.cs.id, c.th.ThreadID, c.th.Cwd, GoalState{})
+		g, err := ga.Goal(gctx, c.cs.id, c.th.ThreadID, c.th.Cwd)
 		cancel()
 		if err != nil && !errors.Is(err, ErrGoalsUnavailable) {
 			e.reply(j, "Model switching is unavailable until the native goal state can be confirmed: "+userError(err.Error()), nil)
@@ -76,8 +76,8 @@ func (e *Engine) applyModelEffort(ctx context.Context, j cmdJob, c modelChat, mo
 		info = e.turnInfo(c.cs.id)
 		goalActive = err == nil && g.Status == GoalActive
 	}
-	if goalActive || info.SelfTurn {
-		e.reply(j, "Model switching is unavailable while an independently continuing Codex goal or external turn is active.", nil)
+	if !goalActive && info.SelfTurn {
+		e.reply(j, "Model switching is unavailable while an external turn is active.", nil)
 		e.wakeRunner(c.cs.id)
 		return
 	}
@@ -85,6 +85,39 @@ func (e *Engine) applyModelEffort(ctx context.Context, j cmdJob, c modelChat, mo
 		e.reply(j, "Close the attached TUI before switching this chat's model settings.", nil)
 		e.wakeRunner(c.cs.id)
 		return
+	}
+	var goalNotice string
+	if goalActive {
+		c.cs.goalMu.Lock()
+		defer c.cs.goalMu.Unlock()
+		var control store.GoalControl
+		if err := e.st.Read(func(tx *store.Tx) error {
+			var err error
+			control, _, err = tx.GoalControl(c.cs.id)
+			return err
+		}); err != nil {
+			e.reply(j, goalFailed(err), nil)
+			return
+		}
+		if control.Inbound > j.inbound {
+			e.reply(j, "The model change was superseded by a newer goal control or cancellation.", nil)
+			return
+		}
+		modelID, reasoning := TurnSettings(c.models, model, effort)
+		call, cancel := context.WithTimeout(ctx, goalCallTimeout)
+		g, err := ga.ActivateGoal(call, c.cs.id, c.th.ThreadID, c.th.Cwd, "", modelID, reasoning)
+		cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil || g.Status != GoalActive {
+			goalNotice = "Codex did not confirm the goal switch. Use `helper goal active` to apply the saved settings."
+			if err != nil {
+				goalNotice += " " + userError(err.Error())
+			}
+		} else {
+			goalNotice = "Codex applied these settings for the goal's next turn."
+		}
 	}
 	changed := false
 	err := e.replyIn(j, func(tx *store.Tx) (string, error) {
@@ -115,6 +148,16 @@ func (e *Engine) applyModelEffort(ctx context.Context, j cmdJob, c modelChat, mo
 			if err = tx.Bind(th); err != nil {
 				return "", err
 			}
+		}
+		if goalActive {
+			cur, _, err := tx.GoalControl(c.cs.id)
+			if err != nil {
+				return "", err
+			}
+			if cur.Inbound > j.inbound {
+				return text + "\nSettings saved. A newer goal control superseded this switch.", nil
+			}
+			return text + "\nSettings saved. " + goalNotice, nil
 		}
 		if changed {
 			open, x := tx.OpenTurnsOf(c.cs.id)

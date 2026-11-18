@@ -17,7 +17,7 @@ import (
 //	                         Codex statuses as they are) and its objective
 //	helper goal <objective>  sets the goal and makes it active
 //	helper goal active       makes the goal active again
-//	helper goal pause        pauses it
+//	helper goal pause        pauses it and stops the current turn
 //
 // An active goal makes Codex keep working on the thread by itself whenever
 // it is idle: those turns reach the chat through the mirror, like a local
@@ -31,11 +31,10 @@ const (
 	goalCallTimeout = 2 * time.Minute
 
 	textGoalUsage = "`helper goal` shows the goal of this chat's Codex thread; `helper goal <objective>` sets it and makes it active; " +
-		"`helper goal active` makes it active again; `helper goal pause` pauses it."
+		"`helper goal active` makes it active again; `helper goal pause` pauses it and stops the current turn."
 	textGoalNoThread    = "This chat has no Codex thread yet. Send a first request, then set its goal."
 	textGoalUnsupported = "Goals are not available: this helper's Codex agent does not support them."
 	textGoalNone        = "No goal is set for this chat.\n\n" + textGoalUsage
-	textGoalPausedHint  = "Codex does not continue it by itself until `helper goal active`."
 	textGoalActiveHint  = "Codex keeps working on it by itself whenever this chat is idle; its messages appear here. `helper goal pause` or `helper cancel` stops it."
 	textCancelGoal      = "⏸️ The goal is paused too, so your next message does not start it again. `helper goal active` resumes it."
 )
@@ -68,6 +67,11 @@ func (e *Engine) cmdGoal(ctx context.Context, j cmdJob, cs *convState, arg strin
 		return
 	}
 	change := goalArg(arg)
+	if change.Status == GoalPaused {
+		e.cmdCancel(ctx, j, cs, "running", true)
+		return
+	}
+	var th store.Thread
 	if change != (GoalState{}) {
 		cs.goalMu.Lock()
 		defer cs.goalMu.Unlock()
@@ -81,13 +85,11 @@ func (e *Engine) cmdGoal(ctx context.Context, j cmdJob, cs *convState, arg strin
 				superseded = true
 				return nil
 			}
-			next := store.GoalControl{Conv: cs.id, Inbound: j.inbound, Thread: threadID, Cwd: cwd}
-			if ok && cur.Pending && change.Status != GoalActive {
-				next.Pending = true
-				next.Turn = cur.Turn
-				next.NativeTurn = cur.NativeTurn
+			th, _, err = tx.Thread(cs.id)
+			if err != nil {
+				return err
 			}
-			return tx.SetGoalControl(next)
+			return tx.SetGoalControl(store.GoalControl{Conv: cs.id, Inbound: j.inbound, Thread: threadID, Cwd: cwd})
 		})
 		if err != nil {
 			e.reply(j, goalFailed(err), nil)
@@ -100,21 +102,23 @@ func (e *Engine) cmdGoal(ctx context.Context, j cmdJob, cs *convState, arg strin
 	}
 	cctx, cancel := context.WithTimeout(ctx, goalCallTimeout)
 	defer cancel()
+	var g GoalState
+	var err error
 	alreadyActive := false
-	if change.Objective == "" && change.Status == GoalActive {
-		// `active` needs a goal: Codex has nothing to make active.
-		cur, err := ga.Goal(cctx, cs.id, threadID, cwd, GoalState{})
-		if err != nil {
-			e.reply(j, goalFailed(err), nil)
-			return
+	if change == (GoalState{}) {
+		g, err = ga.Goal(cctx, cs.id, threadID, cwd)
+	} else {
+		if change.Objective == "" {
+			cur, err := ga.Goal(cctx, cs.id, threadID, cwd)
+			if err != nil {
+				e.reply(j, goalFailed(err), nil)
+				return
+			}
+			alreadyActive = cur.Status == GoalActive
 		}
-		if cur.Status == "" {
-			e.reply(j, textGoalNone, nil)
-			return
-		}
-		alreadyActive = cur.Status == GoalActive
+		g, err = ga.ActivateGoal(cctx, cs.id, threadID, cwd, change.Objective,
+			selector(firstNonEmpty(th.PendingModel, th.Model)), firstNonEmpty(th.PendingEffort, th.Effort))
 	}
-	g, err := ga.Goal(cctx, cs.id, threadID, cwd, change)
 	if err != nil {
 		e.reply(j, goalFailed(err), nil)
 		return
@@ -142,20 +146,16 @@ func (e *Engine) cmdGoal(ctx context.Context, j cmdJob, cs *convState, arg strin
 		}
 	}
 	switch {
+	case g.Status == "":
+		e.reply(j, textGoalNone, nil)
 	case change == (GoalState{}):
-		if g.Status == "" {
-			e.reply(j, textGoalNone, nil)
-			return
-		}
 		e.reply(j, goalText("", g), nil)
 	case change.Objective != "":
 		e.reply(j, goalText("🎯 Goal set.", g)+"\n\n"+textGoalActiveHint, nil)
-	case alreadyActive && g.Status == GoalActive:
+	case alreadyActive:
 		e.reply(j, goalText("The goal is already active.", g)+"\n\n"+textGoalActiveHint, nil)
-	case change.Status == GoalActive:
-		e.reply(j, goalText("▶️ Goal active again.", g)+"\n\n"+textGoalActiveHint, nil)
 	default:
-		e.reply(j, goalText("⏸️ Goal paused. A turn Codex is already running finishes unless you `helper cancel` it.", g)+"\n\n"+textGoalPausedHint, nil)
+		e.reply(j, goalText("▶️ Goal active again.", g)+"\n\n"+textGoalActiveHint, nil)
 	}
 	e.heat(cs.id) // its turns show up in the rollout soon
 }
@@ -183,7 +183,7 @@ func goalFailed(err error) string {
 
 // finishGoalStop reconciles durable intent. A failure leaves it pending and
 // blocks new helper input until a confirmed retry or newer explicit control.
-func (e *Engine) finishGoalStop(ctx context.Context, g store.GoalControl) {
+func (e *Engine) finishGoalStop(ctx context.Context, g store.GoalControl, live bool) {
 	cs := e.conv(g.Conv)
 	if cs == nil {
 		return
@@ -216,22 +216,10 @@ func (e *Engine) finishGoalStop(ctx context.Context, g store.GoalControl) {
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	res, stopErr := ga.StopGoal(cctx, g.Conv, g.Thread, g.Cwd, g.NativeTurn)
+	res, stopErr := ga.StopGoal(cctx, g.Conv, g.Thread, g.Cwd, g.NativeTurn, live)
 	if ctx.Err() != nil {
 		return
 	} // replay on startup; no premature terminal reply
-	text := "Goal state checked: no active goal remains."
-	if res.Paused {
-		text = textCancelGoal
-	}
-	if res.Interrupted {
-		text += " The selected native turn has stopped."
-	}
-	suffix := "confirmed"
-	if stopErr != nil {
-		suffix = "unconfirmed"
-		text = "⚠️ Goal stop is unconfirmed: " + userError(stopErr.Error()) + ". New helper input is held. Retry `helper cancel running` or use `helper goal pause`."
-	}
 	err := e.update(func(tx *store.Tx) error {
 		cur, ok, err := tx.GoalControl(g.Conv)
 		if err != nil {
@@ -240,12 +228,33 @@ func (e *Engine) finishGoalStop(ctx context.Context, g store.GoalControl) {
 		if !ok || cur.Inbound != g.Inbound {
 			return nil
 		}
-		if stopErr == nil {
-			if err := tx.FinishGoalControl(g.Conv, g.Inbound); err != nil {
+		if stopErr != nil {
+			text := "⚠️ Goal stop is unconfirmed: " + userError(stopErr.Error()) + ". New helper input is held. Retry `helper cancel running` or use `helper goal pause`."
+			return e.enqueueNotice(tx, g.Conv, fmt.Sprintf("goal-stop:%d:unconfirmed", g.Inbound), text)
+		}
+		if err := tx.FinishGoalControl(g.Conv, g.Inbound); err != nil {
+			return err
+		}
+		text := "Goal state checked: no active goal remains."
+		if res.Paused {
+			text = textCancelGoal
+		}
+		if res.Objective != "" {
+			in, _, err := tx.Inbound(g.Inbound)
+			if err != nil {
 				return err
 			}
+			body, _ := stripCodexMention(in.Body)
+			cmd := parseWork(body)
+			if cmd.name == cmdGoalName && goalArg(cmd.arg).Status == GoalPaused {
+				text = goalText("⏸️ Goal paused.", GoalState{Status: GoalPaused, Objective: res.Objective}) +
+					"\n\nUse `helper goal active` to resume."
+			}
 		}
-		return e.enqueueNotice(tx, g.Conv, fmt.Sprintf("goal-stop:%d:%s", g.Inbound, suffix), text)
+		if res.Interrupted {
+			text += " The selected native turn has stopped."
+		}
+		return e.enqueueNotice(tx, g.Conv, fmt.Sprintf("goal-stop:%d:confirmed", g.Inbound), text)
 	})
 	if err != nil {
 		e.logf("goal stop %d: %v", g.Inbound, err)
@@ -262,7 +271,7 @@ func (e *Engine) resumeGoalStops(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		e.finishGoalStop(ctx, g)
+		e.finishGoalStop(ctx, g, false)
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/goal"
 )
@@ -195,6 +196,60 @@ func (s *Server) loadedResponse(threadID string, raw json.RawMessage) {
 		tier = &empty
 	}
 	s.setSettings(threadID, m.Model, effort, tier)
+}
+
+// UpdateThreadSettings applies overrides to subsequent turns of a loaded thread.
+func (s *Server) UpdateThreadSettings(ctx context.Context, threadID, model, effort string) error {
+	params := map[string]any{"threadId": threadID}
+	if model != "" {
+		params["model"] = model
+	}
+	if effort != "" {
+		params["effort"] = effort
+	}
+	if len(params) == 1 {
+		return nil
+	}
+	return s.Call(ctx, "thread/settings/update", params, nil)
+}
+
+// ApplyThreadSettings applies settings and waits for their effective native
+// snapshot. A successful RPC alone can omit a setting the server did not use.
+func (s *Server) ApplyThreadSettings(ctx context.Context, threadID, model, effort string) error {
+	matches := func(info ThreadInfo) bool {
+		return (model == "" || info.Model == model) && (effort == "" || info.Effort == effort)
+	}
+	if matches(s.Info(threadID)) {
+		return nil
+	}
+	updated := make(chan struct{}, 1)
+	unsub := s.Subscribe(threadID, func(n Notification) {
+		if n.Method == "thread/settings/updated" {
+			select {
+			case updated <- struct{}{}:
+			default:
+			}
+		}
+	})
+	defer unsub()
+	if err := s.UpdateThreadSettings(ctx, threadID, model, effort); err != nil {
+		return err
+	}
+	wait, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	for {
+		info := s.Info(threadID)
+		if matches(info) {
+			return nil
+		}
+		select {
+		case <-updated:
+		case <-s.Done():
+			return ErrExited
+		case <-wait.Done():
+			return fmt.Errorf("Codex reported %s/%s, expected %s/%s: %w", info.Model, info.Effort, model, effort, wait.Err())
+		}
+	}
 }
 
 // GoalGet reads the goal without loading execution (nil: confirmed none). A Codex without

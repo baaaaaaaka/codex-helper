@@ -27,9 +27,13 @@ func TestGoalCommands(t *testing.T) {
 	})
 	defer s.Finish()
 	run := s.Token("goalrun")
+	runPause := "E2E-CMDGOAL-goalpause"
 	s.Codex.SetScript(func(c harness.CodexCall) harness.CodexBehavior {
 		if c.HasToken(run) {
 			return harness.CodexBehavior{Block: true, Commentary: "Working through the goal " + run, Answer: "LATE-ANSWER-SHOULD-NOT-APPEAR " + run}
+		}
+		if c.HasToken(runPause) {
+			return harness.CodexBehavior{Block: true, Answer: "LATE-ANSWER " + runPause}
 		}
 		return harness.CodexBehavior{}
 	})
@@ -39,6 +43,7 @@ func TestGoalCommands(t *testing.T) {
 	expect(s, work.ID, "helper goal", "This chat has no Codex thread yet.")
 	expect(s, control.ID, "helper goal", "Wrong chat")
 	c, ok := askNotified(s, control.ID, work.ID, "before")
+	thread := c.ThreadID
 	before := answerText(s, work.ID, c)
 	s.Check("without a goal an answer has the model line and no goal line",
 		ok && strings.Contains(before, "🔧 Helper: model - gpt-5-codex, effort - medium, tier - standard 🔧 Helper: ✅ Codex finished responding.") &&
@@ -78,7 +83,6 @@ func TestGoalCommands(t *testing.T) {
 		"goal line only", clip(status, 300))
 	stop := expect(s, work.ID, "helper cancel", "The goal is paused too")
 	_, cancelled := s.WaitSUTMessage(work.ID, "Codex request canceled.", 30*time.Second)
-	s.Codex.ReleaseAll()
 	s.Check("`helper cancel` stops the running turn and pauses the goal", cancelled && strings.Contains(stop, "helper goal active resumes it"),
 		"turn cancelled, goal paused", clip(stop, 300))
 	expect(s, work.ID, "helper goal", "Goal status: paused", "Goal: "+objective)
@@ -94,7 +98,23 @@ func TestGoalCommands(t *testing.T) {
 	expect(s, work.ID, "helper cancel", "The goal is paused too")
 	expect(s, work.ID, "helper goal", "Goal status: paused")
 	expect(s, work.ID, "helper goal resume", "Goal active again.")
+	beforePause := len(s.SUTMessagesContaining(work.ID, "Codex request canceled."))
+	steps.MustPost(s, work.ID, "Long job "+runPause)
+	s.WaitCodexCalls(runPause, 1, steps.AnswerTimeout)
 	expect(s, work.ID, "helper goal pause", "Goal paused.", "Goal status: paused", "Goal: "+objective)
+	stopped := s.Poll(30*time.Second, func() bool {
+		return len(s.SUTMessagesContaining(work.ID, "Codex request canceled.")) > beforePause
+	})
+	// The interrupt must reach the fake app-server, beyond the earlier cancel.
+	s.Check("pause interrupts the currently running request", stopped, "Codex request canceled", fmt.Sprint(stopped))
+	s.Codex.ReleaseAll()
+	expect(s, work.ID, "helper goal active", "Goal active again.")
+	expect(s, work.ID, "helper model use gpt-5-mini low", "Codex applied these settings for the goal's next turn.", "gpt-5-mini")
+	expect(s, work.ID, "helper goal", "Goal status: active", "Goal: "+objective)
+	c, ok = askNotified(s, control.ID, work.ID, "afterswitch")
+	s.Check("the goal survives the model switch on the same thread",
+		ok && c.ThreadID == thread && c.Model == "gpt-5-mini" && c.Effort == "low" && strings.Contains(answerText(s, work.ID, c), "Active goal: "+objective),
+		"same goal, gpt-5-mini/low", clip(answerText(s, work.ID, c), 300))
 	s.Settle(2*time.Second, 10*time.Second)
 	s.Check("the cancelled turn's answer never reaches the chat", len(s.SUTMessagesContaining(work.ID, "LATE-ANSWER")) == 0, "none",
 		fmt.Sprint(len(s.SUTMessagesContaining(work.ID, "LATE-ANSWER"))))

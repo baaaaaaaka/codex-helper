@@ -74,38 +74,48 @@ func (g *goalAgent) Models(ctx context.Context) ([]Model, error) {
 	return g.fakeAgent.Models(ctx)
 }
 
-func (g *goalAgent) Goal(ctx context.Context, _ int64, threadID, _ string, change GoalState) (GoalState, error) {
+func (g *goalAgent) Goal(_ context.Context, _ int64, threadID, _ string) (GoalState, error) {
+	g.gmu.Lock()
+	defer g.gmu.Unlock()
+	g.calls = append(g.calls, "get")
+	return g.goals[threadID], nil
+}
+
+func (g *goalAgent) ActivateGoal(ctx context.Context, _ int64, threadID, _, objective, model, effort string) (GoalState, error) {
 	g.gmu.Lock()
 	hook := g.goalHook
 	g.gmu.Unlock()
 	if hook != nil {
-		if err := hook(ctx, change); err != nil {
+		if err := hook(ctx, GoalState{Objective: objective, Status: GoalActive}); err != nil {
 			return GoalState{}, err
 		}
 	}
 	g.gmu.Lock()
 	defer g.gmu.Unlock()
 	cur := g.goals[threadID]
-	if change == (GoalState{}) {
-		g.calls = append(g.calls, "get")
-		return cur, nil
+	if objective == "" && cur.Status == "" {
+		return GoalState{}, nil
 	}
-	if change.Objective == "" && change.Status == GoalActive && cur.Status == GoalActive {
+	if model != "" {
+		g.settings.Model = model
+	}
+	if effort != "" {
+		g.settings.Effort = effort
+	}
+	if objective == "" && cur.Status == GoalActive {
 		g.calls = append(g.calls, "activate")
 		return cur, nil
 	}
-	if change.Objective != "" {
-		cur.Objective = change.Objective
+	if objective != "" {
+		cur.Objective = objective
 	}
-	if change.Status != "" {
-		cur.Status = change.Status
-	}
+	cur.Status = GoalActive
 	g.goals[threadID] = cur
-	g.calls = append(g.calls, "set "+cur.Status+" "+cur.Objective)
+	g.calls = append(g.calls, "set active "+cur.Objective)
 	return cur, nil
 }
 
-func (g *goalAgent) StopGoal(ctx context.Context, _ int64, threadID, _, nativeTurn string) (GoalStopped, error) {
+func (g *goalAgent) StopGoal(ctx context.Context, _ int64, threadID, _, nativeTurn string, live bool) (GoalStopped, error) {
 	g.gmu.Lock()
 	hook := g.stopHook
 	g.gmu.Unlock()
@@ -121,8 +131,10 @@ func (g *goalAgent) StopGoal(ctx context.Context, _ int64, threadID, _, nativeTu
 		cur.Status = GoalPaused
 		g.goals[threadID] = cur
 		out.Paused, out.Objective = true, cur.Objective
+	} else if cur.Status == GoalPaused {
+		out.Objective = cur.Objective
 	}
-	if g.selfTurn && nativeTurn == firstNonEmpty(g.nativeTurn, "self-turn") {
+	if g.selfTurn && (live && out.Paused || nativeTurn == firstNonEmpty(g.nativeTurn, "self-turn")) {
 		g.selfTurn, out.Interrupted = false, true
 	}
 	g.calls = append(g.calls, "stop")
@@ -230,7 +242,7 @@ func TestGoalAndModelLinesAndGoalCommand(t *testing.T) {
 	if n := r.ag.calls("helper goal"); n != 0 {
 		t.Fatalf("%d goal commands ran as Codex turns", n)
 	}
-	if got := strings.Join(ga.callLog(), " | "); strings.Count(got, "set ") != 3 { // set, pause, active (`active` on an active goal sets nothing)
+	if got := strings.Join(ga.callLog(), " | "); strings.Count(got, "set active") != 2 || strings.Count(got, "stop") != 1 {
 		t.Fatalf("goal calls: %s", got)
 	}
 }

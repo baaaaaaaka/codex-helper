@@ -67,14 +67,16 @@ type GoalAgent interface {
 	// active goal and its effective model, effort and tier (zero when
 	// convID has no app-server).
 	Info(convID int64, threadID string) TurnInfo
-	// Goal reads the goal of threadID (change zero) or sets it as the
-	// user: a new objective and/or a status (GoalActive, GoalPaused). An
-	// active goal on an idle thread makes Codex start working on it.
-	Goal(ctx context.Context, convID int64, threadID, cwd string, change GoalState) (GoalState, error)
+	// Goal reads the native goal without loading execution.
+	Goal(ctx context.Context, convID int64, threadID, cwd string) (GoalState, error)
+	// ActivateGoal applies the chat's settings before starting or resuming the goal.
+	// An empty objective preserves the existing goal and its progress.
+	ActivateGoal(ctx context.Context, convID int64, threadID, cwd, objective, model, effort string) (GoalState, error)
 	// StopGoal is the goal part of `helper cancel`: it pauses the active
 	// goal of threadID, without resuming it, and
-	// interrupts only the selected nativeTurn (empty means no native target).
-	StopGoal(ctx context.Context, convID int64, threadID, cwd, nativeTurn string) (GoalStopped, error)
+	// interrupts the selected native turn. A live stop may select the current
+	// successor after pausing an active goal; recovery stays pinned.
+	StopGoal(ctx context.Context, convID int64, threadID, cwd, nativeTurn string, live bool) (GoalStopped, error)
 }
 
 // ErrGoalsUnavailable is a definitive native capability rejection.
@@ -108,7 +110,7 @@ const (
 type GoalStopped struct {
 	Paused      bool   // an active goal was paused
 	Interrupted bool   // a turn Codex ran by itself was interrupted
-	Objective   string // the paused goal's objective
+	Objective   string // objective of a now-paused goal
 }
 
 // Forked is the new thread of a fork: its id and, when Codex names it, its

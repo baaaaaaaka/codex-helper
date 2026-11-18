@@ -111,7 +111,7 @@ const (
 // transaction and never reaches Codex; the running one is interrupted
 // after the reply is committed, so the reply precedes its "Codex request
 // canceled." (R-20-33).
-func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg string) {
+func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg string, pauseGoal bool) {
 	sel := strings.ToLower(strings.TrimSpace(arg))
 	var interrupt, stopGoal bool
 	var cancelID int64
@@ -119,17 +119,20 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 	// or finds nothing of the helper's to cancel, pauses an active goal
 	// and stops the turn Codex runs by itself for it.
 	_, hasGoals := e.ag.(GoalAgent)
-	goalReply := func(text string) string {
-		if interrupt && hasGoals && e.threadOf(cs.id) != "" {
-			stopGoal = true
-			return text + "\n\nChecking and stopping the goal; confirmation follows."
+	checkGoal := func(text string) string {
+		if !hasGoals || e.threadOf(cs.id) == "" {
+			return text
 		}
-		return text
+		stopGoal = true
+		const notice = "Checking and stopping the goal; confirmation follows."
+		if pauseGoal {
+			return notice
+		}
+		return text + "\n\n" + notice
 	}
-	nothing := func(text string) string {
-		if hasGoals && e.threadOf(cs.id) != "" {
-			stopGoal = true
-			return text + "\n\nChecking and stopping the goal; confirmation follows."
+	goalReply := func(text string) string {
+		if interrupt || pauseGoal {
+			return checkGoal(text)
 		}
 		return text
 	}
@@ -195,7 +198,7 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 			switch sel {
 			case "all":
 				if len(queued) == 0 && running == nil {
-					return nothing(textCancelNone), nil
+					return checkGoal(textCancelNone), nil
 				}
 				text, err := e.cancelAll(tx, queued, running, &interrupt)
 				return goalReply(text), err
@@ -204,10 +207,10 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 					target = running
 				}
 				if target == nil && sel == "" {
-					return nothing("Nothing to cancel: no request is running or queued.\n\n" + textCancelUsage), nil
+					return checkGoal("Nothing to cancel: no request is running or queued.\n\n" + textCancelUsage), nil
 				}
 				if target == nil {
-					return nothing(textCancelNone), nil
+					return checkGoal(textCancelNone), nil
 				}
 			case "queued":
 				if target = newestQueued(); target == nil {
@@ -215,7 +218,7 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 				}
 			case "running":
 				if target = running; target == nil {
-					return nothing(textCancelNoRunning), nil
+					return checkGoal(textCancelNoRunning), nil
 				}
 			default:
 				id, ok := parseTurnRef(sel)
@@ -241,6 +244,15 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 			text, err := e.cancelOne(tx, cs, *target, running != nil && target.ID == running.ID, queued, &interrupt)
 			return goalReply(text), err
 		}
+		if pauseGoal {
+			cur, _, err := tx.GoalControl(cs.id)
+			if err != nil {
+				return "", err
+			}
+			if cur.Inbound > j.inbound {
+				return "This goal change was superseded by a newer goal control or cancellation.", nil
+			}
+		}
 		text, err := selectTarget()
 		if err == nil && stopGoal {
 			nativeTurn := e.turnInfo(cs.id).NativeTurn
@@ -252,7 +264,7 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 		return text, err
 	})
 	if err == nil && stopGoal {
-		e.finishGoalStop(ctx, intent)
+		e.finishGoalStop(ctx, intent, true)
 	}
 	if err == nil && interrupt && !stopGoal {
 		e.cancelRunningFor(ctx, cs.id, cancelID)
