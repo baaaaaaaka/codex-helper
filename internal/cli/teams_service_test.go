@@ -1869,6 +1869,60 @@ func TestTeamsServiceLocalSupervisorChildHealthRestartsChild(t *testing.T) {
 	}
 }
 
+func TestTeamsServiceLocalSupervisorHeartbeatPersistsChangesAndRetries(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	status := teamsServiceLocalSupervisorStatus{State: "running", LastHealthReason: "healthy", LastHealthAction: "noop"}
+	var heartbeat teamsServiceLocalSupervisorHeartbeat
+	var saved teamsServiceLocalSupervisorStatus
+	writes := 0
+	fail := false
+	write := func(value teamsServiceLocalSupervisorStatus) error {
+		writes++
+		if fail {
+			return errors.New("failed status write")
+		}
+		saved = value
+		return nil
+	}
+	tick := func(seconds int) {
+		t.Helper()
+		when := start.Add(time.Duration(seconds) * time.Second)
+		now := when.Add(time.Second) // The check can finish after the tick.
+		status.LastHealthCheckAt = now
+		heartbeat.persist(&status, when, now, write)
+		if saved.UpdatedAt.IsZero() || now.Sub(saved.UpdatedAt) > teamsServiceLocalSupervisorStatusFreshness {
+			t.Fatalf("status became stale at %d seconds: %v", seconds, saved.UpdatedAt)
+		}
+	}
+	for seconds := 0; seconds <= 30; seconds += 5 {
+		tick(seconds)
+	}
+	if writes != 4 || !saved.UpdatedAt.Equal(start.Add(31*time.Second)) {
+		t.Fatalf("healthy status took %d writes and was last published at %v", writes, saved.UpdatedAt)
+	}
+	status.LastHealthReason = "health check unavailable"
+	tick(35)
+	if writes != 5 || saved.LastHealthReason != status.LastHealthReason {
+		t.Fatal("health error was not persisted immediately")
+	}
+	status.LastHealthReason = "healthy"
+	fail = true
+	tick(40)
+	if writes != 6 || saved.LastHealthReason == status.LastHealthReason {
+		t.Fatal("the failed recovery write replaced the saved status")
+	}
+	fail = false
+	tick(45)
+	if writes != 7 || saved.LastHealthReason != "healthy" {
+		t.Fatal("failed recovery was not retried on the next tick")
+	}
+	status.LastHealthAction = "wait"
+	tick(50)
+	if writes != 8 || saved.LastHealthAction != "wait" {
+		t.Fatal("new health action was not written immediately")
+	}
+}
+
 func TestTeamsServiceLocalSupervisorChildHealthTerminateErrorReturns(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("local supervisor child process-group termination is Unix-only")

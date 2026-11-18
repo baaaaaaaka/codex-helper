@@ -26,6 +26,7 @@ const (
 	teamsServiceLocalSupervisorStatusVersion     = 1
 	teamsServiceLocalSupervisorActivationVersion = 1
 	teamsServiceLocalSupervisorStatusFreshness   = 30 * time.Second
+	teamsServiceLocalSupervisorHeartbeatPersist  = 10 * time.Second
 	teamsServiceLocalSupervisorRetireTimeout     = 3 * time.Second
 	teamsServiceLocalSupervisorMaxLogBytes       = 5 * 1024 * 1024
 	teamsServiceLocalSupervisorLogBackups        = 3
@@ -712,6 +713,30 @@ func runTeamsServiceLocalSupervisor(ctx context.Context, configPath string) erro
 	}
 }
 
+// Only the health reason, action, and timestamps change during a child's
+// periodic health checks. Child lifecycle transitions write immediately.
+type teamsServiceLocalSupervisorHeartbeat struct {
+	savedTick time.Time
+	reason    string
+	action    string
+	retry     bool
+}
+
+func (h *teamsServiceLocalSupervisorHeartbeat) persist(status *teamsServiceLocalSupervisorStatus, tick, now time.Time, write func(teamsServiceLocalSupervisorStatus) error) {
+	// Compare scheduled ticks so health-check latency does not slip the
+	// 10-second cadence to a third tick. Persist the actual observation time.
+	if !h.savedTick.IsZero() && !h.retry && tick.Sub(h.savedTick) < teamsServiceLocalSupervisorHeartbeatPersist &&
+		status.LastHealthReason == h.reason && status.LastHealthAction == h.action {
+		return
+	}
+	status.UpdatedAt = now
+	if err := write(*status); err != nil {
+		h.retry = true
+		return
+	}
+	*h = teamsServiceLocalSupervisorHeartbeat{savedTick: tick, reason: status.LastHealthReason, action: status.LastHealthAction}
+}
+
 func runTeamsServiceLocalSupervisorChild(ctx context.Context, cfg teamsServiceLocalSupervisorConfig, status *teamsServiceLocalSupervisorStatus, logFile io.Writer) error {
 	args := buildTeamsServiceRunArgs(cfg.Spec)
 	cmd := exec.Command(cfg.Spec.Executable, args...)
@@ -731,9 +756,9 @@ func runTeamsServiceLocalSupervisorChild(ctx context.Context, cfg teamsServiceLo
 	status.ChildPGID = childPGID
 	status.ChildIdentity = teamsServiceLocalSupervisorIdentityForProcess(cmd.Process.Pid, cfg.Spec.Executable, args, cfg.Spec.Environment)
 	status.LastChildStartAt = time.Now()
-	status.UpdatedAt = status.LastChildStartAt
 	status.LastError = ""
-	_ = writeTeamsServiceLocalSupervisorStatus(*status)
+	var heartbeat teamsServiceLocalSupervisorHeartbeat
+	heartbeat.persist(status, status.LastChildStartAt, status.LastChildStartAt, writeTeamsServiceLocalSupervisorStatus)
 
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -751,7 +776,7 @@ func runTeamsServiceLocalSupervisorChild(ctx context.Context, cfg teamsServiceLo
 			}
 			clearTeamsServiceLocalSupervisorChild(status, waitErr)
 			return ctx.Err()
-		case <-ticker.C:
+		case tick := <-ticker.C:
 			decision, err := teamsServiceLocalSupervisorChildHealth(ctx, cfg, &healthState)
 			if err != nil {
 				status.LastHealthCheckAt = time.Now()
@@ -782,8 +807,7 @@ func runTeamsServiceLocalSupervisorChild(ctx context.Context, cfg teamsServiceLo
 					return fmt.Errorf("local supervisor health check restarted child: %s", decision.Reason)
 				}
 			}
-			status.UpdatedAt = time.Now()
-			_ = writeTeamsServiceLocalSupervisorStatus(*status)
+			heartbeat.persist(status, tick, time.Now(), writeTeamsServiceLocalSupervisorStatus)
 		case err := <-done:
 			if !teamsServiceLocalSupervisorChildGone(cmd.Process.Pid, childPGID) {
 				cleanupErr := fmt.Errorf("child pid %d or process group %d remains after cmd.Wait", cmd.Process.Pid, childPGID)
