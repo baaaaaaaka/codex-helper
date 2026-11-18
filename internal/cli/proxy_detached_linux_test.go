@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -153,11 +154,17 @@ func TestStartCodexAppProxyDaemonReapsExitedDetachedChild(t *testing.T) {
 }
 
 func linuxProcessState(pid int) (byte, bool, error) {
+	return readLinuxProcessState(pid, os.ReadFile)
+}
+
+func readLinuxProcessState(pid int, readFile func(string) ([]byte, error)) (byte, bool, error) {
 	if pid <= 0 {
 		return 0, false, errors.New("invalid pid")
 	}
-	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
-	if errors.Is(err, os.ErrNotExist) {
+	data, err := readFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	// procfs can return ESRCH when the process exits after the stat file
+	// was opened but before its contents were read.
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
 		return 0, false, nil
 	}
 	if err != nil {
@@ -172,4 +179,17 @@ func linuxProcessState(pid int) (byte, bool, error) {
 		return 0, true, errors.New("missing process state in /proc stat")
 	}
 	return fields[0][0], true, nil
+}
+
+func TestLinuxProcessStateHandlesExitedProcess(t *testing.T) {
+	for _, cause := range []error{syscall.ENOENT, syscall.ESRCH} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			_, exists, err := readLinuxProcessState(123, func(path string) ([]byte, error) {
+				return nil, &os.PathError{Op: "read", Path: path, Err: cause}
+			})
+			if exists || err != nil {
+				t.Fatalf("exited process: exists=%v, err=%v", exists, err)
+			}
+		})
+	}
 }
