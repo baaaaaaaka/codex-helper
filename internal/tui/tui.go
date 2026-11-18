@@ -70,16 +70,19 @@ const (
 
 type Options struct {
 	// LoadProjects returns a snapshot; callers must not mutate its slices after return.
-	LoadProjects    func(context.Context) ([]codexhistory.Project, error)
-	Version         string
-	CheckUpdate     func(context.Context) update.Status
-	PreviewMessages int
-	ProxyEnabled    bool
-	ProxyConfigured bool
-	AAAEnabled      bool
-	RefreshInterval time.Duration
-	PersistAAA      func(bool) error
-	DefaultCwd      string
+	LoadProjects func(context.Context) ([]codexhistory.Project, error)
+	// LoadInitialProjects can publish one usable recent snapshot before returning
+	// the complete snapshot. It is called only at selector startup.
+	LoadInitialProjects func(context.Context, func([]codexhistory.Project)) ([]codexhistory.Project, error)
+	Version             string
+	CheckUpdate         func(context.Context) update.Status
+	PreviewMessages     int
+	ProxyEnabled        bool
+	ProxyConfigured     bool
+	AAAEnabled          bool
+	RefreshInterval     time.Duration
+	PersistAAA          func(bool) error
+	DefaultCwd          string
 	// OnReady runs once after drawing the first frame, before handling input.
 	OnReady func() error
 }
@@ -163,6 +166,7 @@ type previewLinesCacheEntry struct {
 type projectLoadEvent struct {
 	projects []codexhistory.Project
 	err      error
+	recent   bool
 }
 
 type updateEvent struct {
@@ -333,15 +337,28 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 
 	projectLoadCh := make(chan projectLoadEvent, 1)
 	go func() {
-		projects, err := opts.LoadProjects(loadCtx)
-		select {
-		case <-done:
-			return
-		case <-loadCtx.Done():
-			return
-		case projectLoadCh <- projectLoadEvent{projects: projects, err: err}:
+		send := func(ev projectLoadEvent) {
+			select {
+			case <-done:
+				return
+			case <-loadCtx.Done():
+				return
+			case projectLoadCh <- ev:
+			}
+			postUIEventWithRetry(loadCtx, done, screen, &uiEvent{when: time.Now(), kind: "load"})
 		}
-		postUIEventWithRetry(loadCtx, done, screen, &uiEvent{when: time.Now(), kind: "load"})
+		var projects []codexhistory.Project
+		var err error
+		if opts.LoadInitialProjects != nil {
+			projects, err = opts.LoadInitialProjects(loadCtx, func(recent []codexhistory.Project) {
+				if len(recent) > 0 {
+					send(projectLoadEvent{projects: recent, recent: true})
+				}
+			})
+		} else {
+			projects, err = opts.LoadProjects(loadCtx)
+		}
+		send(projectLoadEvent{projects: projects, err: err})
 	}()
 
 	go func() {
@@ -452,9 +469,12 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 					select {
 					case ev := <-projectLoadCh:
 						cancelLoadingTicker()
-						state.loadingProjects = false
-						state.projects = ev.projects
-						state.projectRevision++
+						state.loadingProjects = ev.recent
+						if ev.err == nil || len(state.projects) == 0 {
+							state.pendingSelection = state.currentSelection
+							state.projects = ev.projects
+							state.projectRevision++
+						}
 						state.loadError = ev.err
 					default:
 						goto nextEvent
@@ -722,7 +742,7 @@ func handleKey(
 			enterPressed = true
 		}
 	}
-	if state.loadingProjects && enterPressed {
+	if shouldShowLoadingRows(state) && enterPressed {
 		return nil, nil
 	}
 
@@ -968,7 +988,7 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		{text: aaaLabel + "  ", style: aaaStyle},
 		{text: "  q: quit", style: baseStatusStyle},
 	}
-	if state.loadingProjects {
+	if shouldShowLoadingRows(state) {
 		statusSegments = []statusSegment{
 			{text: loadingStatusText(state) + "  " + proxyLabel + "  ", style: baseStatusStyle},
 			{text: aaaLabel + "  ", style: aaaStyle},
@@ -1015,6 +1035,9 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 			{text: fmt.Sprintf("Update check failed: %s", state.updateStatus.Error), style: baseStatusStyle},
 			{text: aaaLabel, style: aaaStyle},
 		}
+	}
+	if state.loadingProjects && len(state.projects) > 0 {
+		statusSegments = append(statusSegments, statusSegment{text: "  Indexing remaining history…", style: baseStatusStyle})
 	}
 
 	updateRight := versionLabel(opts.Version)
@@ -1805,7 +1828,7 @@ func buildPreviewLines(
 	previewText string,
 	opts Options,
 ) []string {
-	if state.loadError != nil {
+	if state.loadError != nil && len(state.projects) == 0 {
 		return []string{fmt.Sprintf("Load error: %v", state.loadError)}
 	}
 	if shouldShowLoadingRows(state) {

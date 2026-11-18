@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 var ErrSessionsDirNotFound = errors.New("Codex sessions dir not found")
@@ -17,13 +18,20 @@ func DiscoverProjects(codexDir string) ([]Project, error) {
 }
 
 func DiscoverProjectsContext(ctx context.Context, codexDir string) (projects []Project, retErr error) {
-	return discoverProjectsContext(ctx, codexDir, readSessionFileMetaCachedContext)
+	return discoverProjectsContext(ctx, codexDir, readSessionFileMetaCachedContext, nil)
 }
 
 // DiscoverProjectSummariesContext builds the browser's directory without
 // requiring complete transcripts or a usable persistent session catalog.
 // MessageCount is -1 when only part of a transcript was examined.
 func DiscoverProjectSummariesContext(ctx context.Context, codexDir string) ([]Project, error) {
+	return DiscoverProjectSummariesWithRecent(ctx, codexDir, nil)
+}
+
+// DiscoverProjectSummariesWithRecent may publish one recent snapshot during a
+// cold catalog load. Its return value is the same complete directory as
+// DiscoverProjectSummariesContext. The loader never mutates a published snapshot.
+func DiscoverProjectSummariesWithRecent(ctx context.Context, codexDir string, publishRecent func([]Project)) ([]Project, error) {
 	if ctx != nil && ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
@@ -33,10 +41,12 @@ func DiscoverProjectSummariesContext(ctx context.Context, codexDir string) ([]Pr
 	}
 	reader := sessionSummaryReader{}
 	reader.catalog, _ = currentCatalogSQLiteStore(filepath.Join(root, "history.jsonl"))
-	return discoverProjectsContext(ctx, root, reader.read)
+	return discoverProjectsContext(ctx, root, reader.read, publishRecent)
 }
 
-func discoverProjectsContext(ctx context.Context, codexDir string, readMeta func(context.Context, string) (sessionFileMeta, error)) (projects []Project, retErr error) {
+const recentSessionFileLimit = 64
+
+func discoverProjectsContext(ctx context.Context, codexDir string, readMeta func(context.Context, string) (sessionFileMeta, error), publishRecent func([]Project)) (projects []Project, retErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -86,6 +96,54 @@ func discoverProjectsContext(ctx context.Context, codexDir string, readMeta func
 
 	ctx = prefetchCatalogMetadata(ctx, root, files)
 
+	if publishRecent != nil && len(files) > recentSessionFileLimit {
+		cached, _ := ctx.Value(catalogMetadataKey{}).(map[string]*catalogSessionMetaEntry)
+		if len(cached) == 0 {
+			paths := recentSessionFiles(ctx, files)
+			// The full pass reads and persists these same paths in its normal
+			// order. A file removed after the recent pass must leave no staged row.
+			recentCtx, _ := withCatalogSessionMetaBatch(ctx)
+			recent, _ := discoverProjectsFromFiles(recentCtx, paths, readMeta, historyIdx, threadNames, true)
+			if len(recent) > 0 && ctx.Err() == nil {
+				publishRecent(recent)
+			}
+		}
+	}
+	return discoverProjectsFromFiles(ctx, files, readMeta, historyIdx, threadNames, false)
+}
+
+func recentSessionFiles(ctx context.Context, files []string) []string {
+	type candidate struct {
+		path string
+		id   string
+		time time.Time
+	}
+	candidates := make([]candidate, 0, len(files))
+	counts := make(map[string]int, len(files))
+	for _, path := range files {
+		if ctx.Err() != nil {
+			return nil
+		}
+		id := parseSessionIDFromFilename(filepath.Base(path))
+		if id == "" {
+			continue
+		}
+		counts[id]++
+		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+			candidates = append(candidates, candidate{path: path, id: id, time: info.ModTime()})
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].time.After(candidates[j].time) })
+	paths := make([]string, 0, recentSessionFileLimit)
+	for _, item := range candidates[:min(len(candidates), recentSessionFileLimit)] {
+		if counts[item.id] == 1 {
+			paths = append(paths, item.path)
+		}
+	}
+	return paths
+}
+
+func discoverProjectsFromFiles(ctx context.Context, files []string, readMeta func(context.Context, string) (sessionFileMeta, error), historyIdx historyIndex, threadNames threadNameIndex, mainOnly bool) ([]Project, error) {
 	var firstErr error
 	sessionIndex := make(map[string]int, len(files))
 	sessions := make([]Session, 0, len(files))
@@ -141,6 +199,9 @@ func discoverProjectsContext(ctx context.Context, codexDir string, readMeta func
 
 		// Separate subagents from main sessions.
 		if meta.IsSubagent {
+			if mainOnly {
+				continue
+			}
 			sub := SubagentSession{
 				AgentID:         meta.SubagentType,
 				ParentSessionID: meta.ParentThreadID,
@@ -188,7 +249,7 @@ func discoverProjectsContext(ctx context.Context, codexDir string, readMeta func
 		return sessions[i].ModifiedAt.After(sessions[j].ModifiedAt)
 	})
 
-	projects = groupByProject(sessions)
+	projects := groupByProject(sessions)
 
 	sort.Slice(projects, func(i, j int) bool {
 		return strings.ToLower(projects[i].Path) < strings.ToLower(projects[j].Path)
