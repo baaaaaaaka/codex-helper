@@ -149,3 +149,5 @@ CI 覆盖：普通测试由 `ci.yml` 的 `unit-linux` 及跨平台 unit job 收�
 修正后实际运行 `bash scripts/ci/run_e2e_shard.sh 0` 通过；容器使用 `GOFLAGS=-p=2 GOMAXPROCS=2` 以适应 PID 配额。第一次运行该分片时默认编译并行度触发 `resource temporarily unavailable`，调整容器编译并行度后通过；与功能测试失败分开记录。
 
 提交后的主分支 CI：E2E shard 2 的 `TestStatusWhileTheHelperRunsAndWithout` 在启动状态已有版本、但仍有一条通知排队时提前断言队列为空。该场景后来确认队列正常清空；已让等待条件包含队列清空和版本非空，保留原断言。隔离 Docker 中 `go test ./internal/e2e/scenarios/entry -run '^TestStatusWhileTheHelperRunsAndWithout$' -count=3 -timeout=180s` 通过。没有更改生产代码。
+
+发布候选 `v0.1.23-rc.50` 的主分支 CI 已通过；Release 在 `macos-15` 预检等待 runner 时终止。GitHub 注释报告 hosted runner 多次未能获取该任务，且 macOS ARM64 存在容量限制；该任务没有执行步骤。`rc.49` 与 `rc.50` 的 tag 保留，后续候选从包含最新上游兼容性文档的提交重新验证，不改变发布门禁。
