@@ -433,6 +433,25 @@ func TestHelperSessionDisplayTitleAndFiltering(t *testing.T) {
 	}
 }
 
+func TestHelperTitlePrefixPreservesLowercaseMatching(t *testing.T) {
+	for _, prefix := range []string{HelperSessionTitleKeyword, HelperControlSessionTitleKeyword, HelperDebugSessionTitleKeyword} {
+		for _, title := range []string{prefix, strings.ToUpper(prefix) + " 项目", "项目 " + prefix, prefix[:len(prefix)-1], prefix + "\xff", ""} {
+			want := strings.HasPrefix(strings.ToLower(title), prefix)
+			if got := hasLowercasePrefix(title, prefix); got != want {
+				t.Errorf("prefix %q in %q: got %t, want %t", prefix, title, got, want)
+			}
+		}
+	}
+	// Unicode lowercase maps the capital dotted I to ASCII i here.
+	const legacy = "You are handling an unrecognized message from the user's MİCROSOFT Teams control chat for codex-helper."
+	if !isLegacyControlFallbackPrompt("\u2003" + legacy + "\nUSER MESSAGE: 内容") {
+		t.Fatal("mixed-case legacy control prompt was not identified")
+	}
+	if isLegacyControlFallbackPrompt(legacy) || isLegacyControlFallbackPrompt("文档 "+legacy+"\nUSER MESSAGE: 内容") {
+		t.Fatal("incomplete or unanchored control prompt was identified")
+	}
+}
+
 func TestFilterUserVisibleProjectsGroupsBySessionWorkspace(t *testing.T) {
 	projects := []Project{{
 		Key:  "stale-discovery-record",
