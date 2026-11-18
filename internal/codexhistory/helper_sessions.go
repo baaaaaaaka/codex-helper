@@ -1,6 +1,10 @@
 package codexhistory
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
 
 const (
 	HelperSessionTitleKeyword        = "[codex-helper]"
@@ -205,12 +209,9 @@ func helperSessionKindFromTitleFields(fields ...string) string {
 }
 
 func isLegacyControlFallbackPrompt(field string) bool {
-	lower := strings.ToLower(strings.TrimSpace(field))
-	if lower == "" {
-		return false
-	}
-	return strings.HasPrefix(lower, "you are handling an unrecognized message from the user's microsoft teams control chat for codex-helper.") &&
-		strings.Contains(lower, "\nuser message:")
+	const prefix = "you are handling an unrecognized message from the user's microsoft teams control chat for codex-helper."
+	field = strings.TrimSpace(field)
+	return hasLowercasePrefix(field, prefix) && strings.Contains(strings.ToLower(field), "\nuser message:")
 }
 
 func isKnownHelperTempDebugSession(s Session) bool {
@@ -293,15 +294,28 @@ func hasHelperTitleKeyword(title string) bool {
 }
 
 func helperMarkerKindFromTitle(title string) (string, bool) {
-	lower := strings.ToLower(strings.TrimSpace(title))
+	title = strings.TrimSpace(title)
 	switch {
-	case strings.HasPrefix(lower, strings.ToLower(HelperControlSessionTitleKeyword)):
+	case hasLowercasePrefix(title, HelperControlSessionTitleKeyword):
 		return helperSessionKindControl, true
-	case strings.HasPrefix(lower, strings.ToLower(HelperDebugSessionTitleKeyword)):
+	case hasLowercasePrefix(title, HelperDebugSessionTitleKeyword):
 		return helperSessionKindDebug, true
-	case strings.HasPrefix(lower, strings.ToLower(HelperSessionTitleKeyword)):
+	case hasLowercasePrefix(title, HelperSessionTitleKeyword):
 		return helperSessionKindDebug, true
 	default:
 		return "", false
 	}
+}
+
+// hasLowercasePrefix matches a lowercase prefix with the same case mapping
+// as strings.ToLower, without visiting the rest of the text.
+func hasLowercasePrefix(text, lowerPrefix string) bool {
+	for _, want := range lowerPrefix {
+		got, width := utf8.DecodeRuneInString(text)
+		if width == 0 || unicode.ToLower(got) != want {
+			return false
+		}
+		text = text[width:]
+	}
+	return true
 }
