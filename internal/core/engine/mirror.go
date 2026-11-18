@@ -963,7 +963,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	read := int64(0)
 	records := 0
 	for read < mirrorPassMax && records < mirrorRecordsMax {
-		lines, next, err := transcript.Read(fh, f.tracker.Offset(), mirrorChunk)
+		lines, next, err := transcript.ReadLimited(fh, f.tracker.Offset(), mirrorChunk, mirrorRecordsMax-records)
 		if err != nil {
 			e.logf("mirror read %s: %v", filepath.Base(f.src.Path), err)
 			break
@@ -971,10 +971,6 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		if len(lines) == 0 {
 			f.tracker.Advance(next)
 			break
-		}
-		if len(lines) > mirrorRecordsMax-records {
-			lines = lines[:mirrorRecordsMax-records]
-			next = lines[len(lines)-1].End
 		}
 		records += len(lines)
 		outs = append(outs, f.tracker.Feed(lines)...)

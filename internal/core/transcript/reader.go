@@ -30,6 +30,12 @@ type Line struct {
 // newline is incomplete and is left for a later call. next is the offset
 // after the last returned (or skipped) complete line.
 func Read(f *os.File, off, maxBytes int64) (lines []Line, next int64, err error) {
+	return ReadLimited(f, off, maxBytes, 0)
+}
+
+// ReadLimited is Read with an additional limit on returned records. A
+// non-positive maxRecords is unlimited. An alignment skip does not count.
+func ReadLimited(f *os.File, off, maxBytes int64, maxRecords int) (lines []Line, next int64, err error) {
 	if off < 0 {
 		off = 0
 	}
@@ -48,7 +54,7 @@ func Read(f *os.File, off, maxBytes int64) (lines []Line, next int64, err error)
 	r := bufio.NewReaderSize(io.NewSectionReader(f, off, 1<<62), 64<<10)
 	pos := off
 	var read int64
-	for maxBytes <= 0 || read < maxBytes {
+	for (maxBytes <= 0 || read < maxBytes) && (maxRecords <= 0 || len(lines) < maxRecords) {
 		start := pos
 		data, n, over, cut, complete, rerr := readLine(r)
 		pos += n
