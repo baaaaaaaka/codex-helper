@@ -319,6 +319,15 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 			LoadProjects: func(ctx context.Context) ([]codexhistory.Project, error) {
 				return loadHistoryTuiProjects(ctx, paths.CodexDir)
 			},
+			LoadInitialProjects: func(ctx context.Context, publish func([]codexhistory.Project)) ([]codexhistory.Project, error) {
+				projects, err := codexhistory.DiscoverProjectSummariesWithRecent(ctx, paths.CodexDir, func(recent []codexhistory.Project) {
+					recent = filterHistoryTuiProjects(recent)
+					if len(codexhistory.FilterUserVisibleProjects(recent)) > 0 {
+						publish(recent)
+					}
+				})
+				return filterHistoryTuiProjects(projects), err
+			},
 			Version:         version,
 			ProxyEnabled:    useProxy,
 			ProxyConfigured: len(cfg.Profiles) > 0,

@@ -661,6 +661,83 @@ func TestSelectSessionCancellationWhenWakeQueueIsFull(t *testing.T) {
 	}
 }
 
+func TestSelectSessionRecentResultsRemainUsable(t *testing.T) {
+	for _, mode := range []string{"open early", "full list replaces recent", "full load fails"} {
+		t.Run(mode, func(t *testing.T) {
+			screen, initialized, events := newObservedSelectSessionTestScreen(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			path := t.TempDir()
+			a := codexhistory.Session{SessionID: "A", FirstPrompt: "recent task"}
+			b := codexhistory.Session{SessionID: "B", FirstPrompt: "another task"}
+			release, stopped := make(chan struct{}), make(chan struct{})
+			var refreshes atomic.Int32
+			type outcome struct {
+				selection *Selection
+				err       error
+			}
+			finished := make(chan outcome, 1)
+			go func() {
+				selection, err := SelectSession(ctx, Options{
+					DefaultCwd: path,
+					LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
+						refreshes.Add(1)
+						return nil, nil
+					},
+					LoadInitialProjects: func(ctx context.Context, publish func([]codexhistory.Project)) ([]codexhistory.Project, error) {
+						defer close(stopped)
+						publish([]codexhistory.Project{{Path: path, Sessions: []codexhistory.Session{a}}})
+						select {
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						case <-release:
+						}
+						if mode == "full load fails" {
+							return []codexhistory.Project{{Path: path, Sessions: []codexhistory.Session{b}}}, errors.New("full load failed")
+						}
+						return []codexhistory.Project{{Path: path, Sessions: []codexhistory.Session{b, a}}}, nil
+					},
+				})
+				finished <- outcome{selection, err}
+			}()
+			receive(t, initialized)
+			if err := waitForSelectSessionUIEvent(ctx, events, "load"); err != nil {
+				t.Fatal(err)
+			}
+			for _, ev := range []tcell.Event{
+				&uiEvent{kind: "refresh"},
+				tcell.NewEventKey(tcell.KeyRune, 'r', 0),
+				tcell.NewEventKey(tcell.KeyTab, 0, 0),
+				tcell.NewEventKey(tcell.KeyDown, 0, 0),
+			} {
+				if err := screen.PostEvent(ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := waitForSelectSessionKey(ctx, events, tcell.KeyDown, 0); err != nil {
+				t.Fatal(err)
+			}
+			if mode != "open early" {
+				close(release)
+				if err := waitForSelectSessionUIEvent(ctx, events, "load"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := screen.PostEvent(tcell.NewEventKey(tcell.KeyEnter, 0, 0)); err != nil {
+				t.Fatal(err)
+			}
+			result := receive(t, finished)
+			if result.err != nil || result.selection == nil || result.selection.SourceThreadID != "A" {
+				t.Fatalf("opened the wrong session: %+v, %v", result.selection, result.err)
+			}
+			receive(t, stopped)
+			if refreshes.Load() != 0 {
+				t.Fatal("startup load overlapped a refresh")
+			}
+		})
+	}
+}
+
 func TestSelectSessionCtrlNDuringBlockedInitialLoad(t *testing.T) {
 	screen := tcell.NewSimulationScreen("UTF-8")
 	previous := newScreen

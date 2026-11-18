@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -164,6 +165,64 @@ func TestSessionSummaryRecencyAndCancellation(t *testing.T) {
 	cancel()
 	if _, err = DiscoverProjectSummariesContext(ctx, root); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation: %v", err)
+	}
+}
+
+func TestSessionSummaryRecentKeepsCompleteDiscoveryOrder(t *testing.T) {
+	root, dir, project := setupCodexDir(t)
+	parent := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	child := "11111111-2222-3333-4444-555555555555"
+	duplicate := "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+	older := "2026-01-01T00:00:00Z"
+	newer := "2026-01-02T00:00:00Z"
+	oldTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	write := func(id, ts, source, title string, mod time.Time) {
+		t.Helper()
+		path := writeSessionFile(t, dir, id, ts, project, source, title)
+		if err := os.Chtimes(path, mod, mod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range recentSessionFileLimit {
+		write(fmt.Sprintf("aaaaaaaa-0000-0000-0000-%012x", i), older, `"cli"`, "older task", oldTime)
+	}
+	write(parent, older, `"cli"`, "parent", oldTime.Add(2*time.Hour))
+	write(child, older, `{"subagent":{"thread_spawn":{"parent_thread_id":"`+parent+`"}}}`, "child", oldTime.Add(4*time.Hour))
+	write(duplicate, newer, `"cli"`, "newer copy", oldTime.Add(3*time.Hour))
+	oldPath := filepath.Join(dir, "rollout-2026-01-01T00-00-00-"+duplicate+".jsonl")
+	newPath := filepath.Join(dir, "rollout-2026-01-02T00-00-00-"+duplicate+".jsonl")
+	if err := os.Rename(oldPath, newPath); err != nil {
+		t.Fatal(err)
+	}
+	write(duplicate, older, `"cli"`, "older copy", oldTime.Add(time.Hour))
+
+	ctx := context.Background()
+	var recent []Project
+	publishes := 0
+	full, err := DiscoverProjectSummariesWithRecent(ctx, root, func(p []Project) {
+		publishes++
+		recent = p
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := collectAllSessions(recent)
+	main := findSession(sessions, parent)
+	if publishes != 1 || len(sessions) > recentSessionFileLimit || main == nil || len(main.Subagents) != 0 ||
+		findSession(sessions, duplicate) != nil || findSession(sessions, child) != nil {
+		t.Fatalf("invalid recent publish: count=%d, sessions=%d, parent=%+v", publishes, len(sessions), main)
+	}
+	fullSessions := collectAllSessions(full)
+	main = findSession(fullSessions, parent)
+	copy := findSession(fullSessions, duplicate)
+	if main == nil || len(main.Subagents) != 1 || main.Subagents[0].SessionID != child || copy == nil || copy.FirstPrompt != "older copy" {
+		t.Fatal("full discovery changed parent association or the duplicate's canonical title")
+	}
+	ordinary, err := DiscoverProjectSummariesWithRecent(ctx, root, func([]Project) {
+		t.Error("warm catalog published a recent snapshot")
+	})
+	if err != nil || !reflect.DeepEqual(full, ordinary) {
+		t.Fatalf("full cold and ordinary warm discovery differ, error: %v", err)
 	}
 }
 
