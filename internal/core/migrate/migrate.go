@@ -306,7 +306,7 @@ func Candidates(roots ...string) []string {
 		if root == "" {
 			continue
 		}
-		matches, _ := filepath.Glob(filepath.Join(root, "teams", "scopes", "*", "state.json"))
+		matches := legacyScopeStatePaths(filepath.Join(root, "teams", "scopes"))
 		matches = append([]string{filepath.Join(root, "teams", "state.json")}, matches...)
 		for _, m := range matches {
 			if _, err := os.Stat(m); err != nil {
@@ -320,6 +320,34 @@ func Candidates(roots ...string) []string {
 		}
 	}
 	return out
+}
+
+func legacyScopeStatePaths(scopesDir string) []string {
+	// Preserve Glob's interpretation of any pattern characters in the root.
+	if strings.ContainsAny(scopesDir, "*?[") || (os.PathSeparator != '\\' && strings.ContainsRune(scopesDir, '\\')) {
+		matches, _ := filepath.Glob(filepath.Join(scopesDir, "*", "state.json"))
+		return matches
+	}
+
+	var matches []string
+	scopes, _ := os.ReadDir(scopesDir)
+	for _, entry := range scopes {
+		scope := filepath.Join(scopesDir, entry.Name())
+		state := filepath.Join(scope, "state.json")
+		if _, err := os.Stat(state); err != nil {
+			continue
+		}
+		// Check the directory entry only on hits. Glob requires the exact
+		// spelling and a readable directory, even on case-insensitive systems.
+		children, _ := os.ReadDir(scope)
+		for _, child := range children {
+			if child.Name() == "state.json" {
+				matches = append(matches, state)
+				break
+			}
+		}
+	}
+	return matches
 }
 
 var bg = context.Background()

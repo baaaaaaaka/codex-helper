@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -27,6 +28,60 @@ import (
 // write, so rows i-wal and o-wal exist only in store.sqlite-wal.
 
 var testNow = time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+
+func TestCandidatesPreservesLegacyGlobResults(t *testing.T) {
+	root, other := t.TempDir(), t.TempDir()
+	teams := filepath.Join(root, "teams")
+	scopes := filepath.Join(teams, "scopes")
+	putState := func(dir, name string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putState(teams, "state.json")
+	putState(filepath.Join(scopes, "a"), "state.json")
+	putState(filepath.Join(scopes, "z"), "state.json")
+	putState(filepath.Join(scopes, "wrong-case"), "STATE.JSON")
+	putState(filepath.Join(scopes, "empty"), "unrelated")
+	unreadable := filepath.Join(scopes, "unreadable")
+	putState(unreadable, "state.json")
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(unreadable, 0o100); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(unreadable, 0o700) })
+	}
+	putState(filepath.Join(other, "teams", "scopes", "b"), "state.json")
+	if err := os.Symlink(filepath.Join(scopes, "a"), filepath.Join(scopes, "linked")); err != nil && runtime.GOOS != "windows" {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scopes, "plain-file"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots := []string{root, "", other, root, filepath.Join(root, "missing")}
+	var want []string
+	for _, dir := range roots {
+		if dir == "" {
+			continue
+		}
+		matches, err := filepath.Glob(filepath.Join(dir, "teams", "scopes", "*", "state.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, path := range append([]string{filepath.Join(dir, "teams", "state.json")}, matches...) {
+			if _, err := os.Stat(path); err == nil && !slices.Contains(want, filepath.Dir(path)) {
+				want = append(want, filepath.Dir(path))
+			}
+		}
+	}
+	if got := Candidates(roots...); !slices.Equal(got, want) {
+		t.Fatalf("Candidates() = %v, want %v", got, want)
+	}
+}
 
 // fixture copies testdata/<version>/<form> into a writable temp scope dir.
 func fixture(t *testing.T, version, form string) string {
