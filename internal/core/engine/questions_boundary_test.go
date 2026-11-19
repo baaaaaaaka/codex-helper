@@ -635,13 +635,14 @@ func TestQuestionAsyncControlReplySteersWithNativeEnvelope(t *testing.T) {
 	if err := a.emit(g); err != nil {
 		t.Fatal(err)
 	}
-	r.ch.PostUser(ctl, "helper answer Q1 B")
+	answer := "Literal text: " + teamsRequestSafety
+	r.ch.PostUser(ctl, "helper answer Q1 "+answer)
 	r.wait("control reply steer", func() bool { return a.count() == 1 })
 	a.smu.Lock()
 	text := a.inputs[0].Text
 	a.smu.Unlock()
-	if !strings.HasPrefix(text, questionReplyStart) || strings.Contains(text, "User message:") {
-		t.Fatal("control envelope broke native reply", text)
+	if !strings.HasPrefix(text, questionReplyStart) || strings.Contains(text, "User message:") || !strings.Contains(text, answer) {
+		t.Fatalf("steer changed the native reply:\n%s", text)
 	}
 }
 

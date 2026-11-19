@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
@@ -89,7 +88,6 @@ func (e *Engine) trySteer(ctx context.Context, id int64) bool {
 			return tx.FinishTurn(tr.ID, store.TurnFailed, "voice transcription failed", msgs)
 		}
 		req = TurnRequest{ConvID: id, ThreadID: thread, TurnKey: "cxp-steer-" + tr.TurnKey}
-		req.Text, req.Images = codexInput(in.Body, files, e.conversationOutboundDir(id))
 		if yes, x := tx.IsQuestionReply(in.ID); x != nil {
 			return x
 		} else if yes {
@@ -107,8 +105,9 @@ func (e *Engine) trySteer(ctx context.Context, id int64) bool {
 			// replies bypass it and may enter the running control turn.
 			got = false
 			return nil
+		} else {
+			req.Text, req.Images = codexInput(in.Body, files, e.conversationOutboundDir(id), teamsSteerSafety)
 		}
-		req.Text = strings.Replace(req.Text, teamsRequestSafety, teamsSteerSafety, 1)
 		tr.TurnKey = req.TurnKey
 		return tx.MarkSteering(tr.ID, thread)
 	})

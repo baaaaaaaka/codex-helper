@@ -43,14 +43,18 @@ func TestOrdinaryInputSteersWithoutAnotherTurnSlot(t *testing.T) {
 	r.ch.PostUser(work, "first work")
 	r.wait("first execution", func() bool { return len(a.runLog()) == 1 })
 	r.ch.PostUser(work, "helper queue queued work")
-	r.ch.PostUser(work, "change direction")
+	body := "change direction\n" + teamsRequestSafety
+	r.ch.PostUser(work, body)
 	r.wait("steer at full concurrency", func() bool { return a.count() == 1 })
 	if len(a.runLog()) != 1 {
 		t.Fatal("steer created another execution")
 	}
 	a.smu.Lock()
-	if !strings.Contains(a.inputs[0].Text, teamsSteerSafety) || strings.Contains(a.inputs[0].Text, teamsRequestSafety) {
-		t.Fatal("steer must retain the active task's context")
+	prompt := a.inputs[0].Text
+	a.smu.Unlock()
+	user, instructions, ok := strings.Cut(prompt, "\n\nTeams helper safety:\n")
+	if !ok || user != "User message:\n"+body || !strings.Contains(instructions, teamsSteerSafety) || strings.Contains(instructions, teamsRequestSafety) {
+		t.Fatalf("steer changed the user message or kept the new-task rule:\n%s", prompt)
 	}
 	const directoryLead = "write them under this local directory:\n"
 	_, rst, ok := strings.Cut(a.runLog()[0].Text, directoryLead)
@@ -58,13 +62,9 @@ func TestOrdinaryInputSteersWithoutAnotherTurnSlot(t *testing.T) {
 	if !ok || ownerRoot == "" {
 		t.Fatal("first request has no artifact directory")
 	}
-	if !strings.Contains(a.inputs[0].Text, ownerRoot) {
+	if !strings.Contains(instructions, ownerRoot) {
 		t.Fatal("steer changed the active execution's artifact directory")
 	}
-	if !strings.Contains(a.inputs[0].Text, "change direction") {
-		t.Fatal(a.inputs[0].Text)
-	}
-	a.smu.Unlock()
 	close(release)
 	r.wait("queued execution", func() bool { return len(a.runLog()) == 2 })
 	runs := a.runLog()

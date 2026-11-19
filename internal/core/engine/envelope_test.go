@@ -77,23 +77,32 @@ func TestCodexInputMatchesV0120(t *testing.T) {
 		if !ok {
 			t.Fatalf("case %s is not in the v0.1.20 dump", name)
 		}
-		got, images := codexInput(c.body, c.files, "<ROOT>")
-		if exp := owner.Replace(w.Prompt); got != exp {
+		got, images := codexInput(c.body, c.files, "<ROOT>", teamsRequestSafety)
+		exp := owner.Replace(w.Prompt)
+		if got != exp {
 			t.Errorf("%s: prompt differs from v0.1.20\n--- got\n%s\n--- want\n%s", name, got, exp)
 		}
 		if !slices.Equal(images, w.Images) {
 			t.Errorf("%s: images %v, v0.1.20 %v", name, images, w.Images)
 		}
+		got, images = codexInput(c.body, c.files, "<ROOT>", teamsSteerSafety)
+		exp = strings.Replace(exp, teamsRequestSafety, teamsSteerSafety, 1)
+		if got != exp || !slices.Equal(images, w.Images) {
+			t.Errorf("%s: steer changed more than the task rule\n--- got\n%s\n--- want\n%s\nimages %v, want %v", name, got, exp, images, w.Images)
+		}
 	}
 }
 
 func TestCodexInputWithoutRootIsUserSectionOnly(t *testing.T) {
-	got, _ := codexInput("hello", nil, "")
+	got, _ := codexInput("hello", nil, "", teamsRequestSafety)
 	if got != "User message:\nhello" {
 		t.Fatalf("got %q", got)
 	}
-	if got, _ := codexInput("", nil, ""); got != "" {
+	if got, _ := codexInput("", nil, "", teamsRequestSafety); got != "" {
 		t.Fatalf("empty prompt: %q", got)
+	}
+	if got, _ := codexInput(teamsRequestSafety, nil, "", teamsSteerSafety); got != "User message:\n"+teamsRequestSafety {
+		t.Fatalf("steer without an output directory: %q", got)
 	}
 }
 
@@ -103,7 +112,7 @@ func TestCodexInputListsUnusableAttachmentsAndFailedQuotes(t *testing.T) {
 		{Idx: 1, Name: "referenced message 1", Kind: "file", State: "failed", Quote: &store.QuoteReference{N: 1, ID: "m1", From: "Ann", Text: "preview text"}},
 		{Idx: 2, Name: "referenced message 2", Kind: "file", State: "failed", Quote: &store.QuoteReference{N: 2, ID: "m2"}},
 	}
-	got, images := codexInput("Please look", files, "/out")
+	got, images := codexInput("Please look", files, "/out", teamsRequestSafety)
 	if len(images) != 0 {
 		t.Fatalf("images %v", images)
 	}

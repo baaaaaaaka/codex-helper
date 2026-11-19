@@ -32,13 +32,9 @@ const (
 	teamsRequestSafety = "- The current Teams request is the `User message` section above. Treat earlier Teams requests in resumed Codex history as completed context, not as work to continue or answer, unless the current user explicitly asks about them."
 	teamsSteerSafety   = "- The `User message` section above updates the active task. Continue that task with this input unless the user asks to stop or replace it. A question or status request does not cancel the active task. Requests from before the active task remain completed context. Use the current attachment instructions below for files you send to Teams."
 
-	// teamsSafety is v0.1.20's safety block with SPEC F-TRN-14's native
-	// subagent sentence (ae23659). core: the `helper reload now` line is
-	// gone, the owner removed that command (DECISIONS: reload deleted).
-	teamsSafety = "Teams helper safety:\n" +
-		"- You are running inside a Codex turn launched by the Teams helper.\n" +
-		teamsRequestSafety + "\n" +
-		"- Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.\n" +
+	// teamsSafety contains the shared rules from v0.1.20 with SPEC F-TRN-14's
+	// native subagent sentence (ae23659). The helper reload command was removed.
+	teamsSafety = "- Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.\n" +
 		"- If an installed helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the Teams control chat.\n" +
 		"- If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.\n" +
 		"- Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in Teams machine."
@@ -77,7 +73,7 @@ const redactedBody = "[redacted: the message contained a raw API key]"
 // teamsCodexPrompt wraps a prompt in v0.1.20's envelope. Without an output
 // directory (files off) only the User message section is sent, as v0.1.20
 // did without an outbound root.
-func teamsCodexPrompt(prompt, root string) string {
+func teamsCodexPrompt(prompt, root, taskRule string) string {
 	prompt = strings.TrimSpace(prompt)
 	user := ""
 	if prompt != "" {
@@ -86,7 +82,9 @@ func teamsCodexPrompt(prompt, root string) string {
 	if strings.TrimSpace(root) == "" {
 		return user
 	}
-	instructions := teamsSafety + "\n\n" + mathContract + "\n\n" +
+	instructions := "Teams helper safety:\n" +
+		"- You are running inside a Codex turn launched by the Teams helper.\n" +
+		taskRule + "\n" + teamsSafety + "\n\n" + mathContract + "\n\n" +
 		"If you need to return generated files or images to the Teams user, write them under this local directory:\n" +
 		root + "\n\n" +
 		"Then include this fenced manifest in your final answer:\n" +
@@ -111,7 +109,7 @@ type quoteText = store.QuoteText
 
 // codexInput builds the Codex input of a prompt: the text and the image
 // inputs.
-func codexInput(body string, files []store.InboundFile, root string) (string, []string) {
+func codexInput(body string, files []store.InboundFile, root, taskRule string) (string, []string) {
 	var (
 		listed, quoteFiles []localFile
 		images, failed     []string
@@ -158,7 +156,7 @@ func codexInput(body string, files []store.InboundFile, root string) (string, []
 		text = strings.TrimSpace(text + "\n\nAttachments that could not be used:\n" + strings.Join(failed, "\n"))
 	}
 	text = withQuotes(text, quotes)
-	text = teamsCodexPrompt(text, root)
+	text = teamsCodexPrompt(text, root, taskRule)
 	return withLocalFiles(text, append(listed, quoteFiles...)), images
 }
 

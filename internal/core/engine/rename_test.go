@@ -35,8 +35,8 @@ func TestTitles(t *testing.T) {
 
 func TestPromptTitle(t *testing.T) {
 	cases := map[string]string{
-		teamsCodexPrompt("Fix it", "/out"): "Fix it",
-		teamsCodexPrompt(withTranscripts("", []promptClip{{name: "v.ogg", text: "list files"}}), "/out"): "list files",
+		teamsCodexPrompt("Fix it", "/out", teamsRequestSafety):                                                               "Fix it",
+		teamsCodexPrompt(withTranscripts("", []promptClip{{name: "v.ogg", text: "list files"}}), "/out", teamsRequestSafety): "list files",
 		"Fix it\n\nHelper safety:\n- x":                       "Fix it",
 		"Read notes\n\nAttached files (saved locally):\n- /a": "Read notes",
 		"Teams helper safety:\n- only the suffix":             "",

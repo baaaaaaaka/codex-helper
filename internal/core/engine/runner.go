@@ -313,7 +313,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		if th.PendingEffort != "" {
 			req.Effort = th.PendingEffort
 		}
-		req.Text, req.Images = codexInput(in.Body, files, e.conversationOutboundDir(id)) // envelope.go (F-TRN-14)
+		req.Text, req.Images = codexInput(in.Body, files, e.conversationOutboundDir(id), teamsRequestSafety) // envelope.go (F-TRN-14)
 		questionReply := false
 		if yes, x := tx.IsQuestionReply(in.ID); x != nil {
 			return x

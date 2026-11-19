@@ -41,7 +41,7 @@ func TestNamedLinksAdmission(t *testing.T) {
 					t.Errorf("%+v want %q", c, want)
 				}
 				// Only the persisted body is needed by a restored or steered turn.
-				prompt, _ := codexInput(c.in.Body, nil, "")
+				prompt, _ := codexInput(c.in.Body, nil, "", teamsRequestSafety)
 				if !strings.Contains(prompt, "任务说明: https://example.com/task") {
 					t.Error(prompt)
 				}

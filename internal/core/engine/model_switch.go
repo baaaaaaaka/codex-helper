@@ -473,11 +473,11 @@ func (e *Engine) continuationRequest(tx *store.Tx, tr store.Turn, req TurnReques
 		if x != nil {
 			return req, x
 		}
-		body, images := codexInput(in.Body, files, e.conversationOutboundDir(tr.ConvID))
+		body, images := codexInput(in.Body, files, e.conversationOutboundDir(tr.ConvID), teamsSteerSafety)
 		if failure := voiceFailure(in.Body, files); failure != "" {
 			body = "The following input was unavailable: " + failure
 		}
-		parts = append(parts, strings.Replace(body, teamsRequestSafety, teamsSteerSafety, 1))
+		parts = append(parts, body)
 		req.Images = append(req.Images, images...)
 	}
 	if len(parts) > 0 {

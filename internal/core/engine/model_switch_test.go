@@ -149,7 +149,8 @@ func TestSwitchCoalescesAndUsesPendingInput(t *testing.T) {
 	case <-r.done:
 		t.Fatal("engine stopped")
 	}
-	r.ch.PostUser(work, "use staging")
+	first := "use staging\n" + teamsRequestSafety
+	r.ch.PostUser(work, first)
 	r.ch.PostUser(work, "model use model-c high")
 	r.ch.PostUser(work, "keep the original scope")
 	r.wait("latest setting committed", func() bool { return len(r.own(work, "Target model: Codex Official (`model-c`)")) > 0 })
@@ -157,8 +158,19 @@ func TestSwitchCoalescesAndUsesPendingInput(t *testing.T) {
 	r.wait("continuation with updates", func() bool { return len(a.runLog()) == 2 })
 	runs := a.runLog()
 	run := runs[1]
-	if run.Model != "model-c" || run.Effort != "high" || !strings.Contains(run.Text, "use staging") || !strings.Contains(run.Text, "keep the original scope") || !strings.Contains(run.Text, teamsSteerSafety) || strings.Contains(run.Text, teamsRequestSafety) || strings.Contains(run.Text, "original task") {
+	if run.Model != "model-c" || run.Effort != "high" || strings.Contains(run.Text, "original task") {
 		t.Fatalf("continuation: %+v", run)
+	}
+	parts := strings.Split(run.Text, "\n\n---\n\n")
+	wantBodies := []string{first, "keep the original scope"}
+	if len(parts) != len(wantBodies) {
+		t.Fatalf("continuation did not carry both inputs:\n%s", run.Text)
+	}
+	for i, body := range wantBodies {
+		user, instructions, ok := strings.Cut(parts[i], "\n\nTeams helper safety:\n")
+		if !ok || user != "User message:\n"+body || !strings.Contains(instructions, teamsSteerSafety) || strings.Contains(instructions, teamsRequestSafety) {
+			t.Fatalf("continuation input %d changed the user message or kept the new-task rule:\n%s", i+1, parts[i])
+		}
 	}
 	root := r.e.conversationOutboundDir(run.ConvID)
 	if !strings.Contains(runs[0].Text, root+"\n") || strings.Count(run.Text, root+"\n") != 2 || !strings.Contains(run.Text, `"version":2`) {

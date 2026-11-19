@@ -434,7 +434,7 @@ type ctlRequest struct {
 // chat's model and effort (low unless set), and the home directory as the
 // working directory (the control chat has no project).
 func (e *Engine) controlRequest(tx *store.Tx, req TurnRequest, in store.Inbound, files []store.InboundFile, th store.Thread) (TurnRequest, ctlRequest, error) {
-	user, images := codexInput(in.Body, files, "")
+	user, images := codexInput(in.Body, files, "", teamsRequestSafety)
 	user = strings.TrimPrefix(user, userMessageLead+"\n")
 	e.mu.Lock()
 	cs := e.convs[req.ConvID]

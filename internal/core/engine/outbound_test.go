@@ -61,7 +61,7 @@ func TestCodexInputListsAttachments(t *testing.T) {
 		{Idx: 2, Name: "v.ogg", Kind: "voice", State: "ready", LocalPath: voice},
 		{Idx: 3, Name: "gone.pdf", Kind: "file", State: "failed", Error: "the attachment could not be downloaded"},
 	}
-	text, images := codexInput("Please look", files, "/out")
+	text, images := codexInput("Please look", files, "/out", teamsRequestSafety)
 	if len(images) != 1 || images[0] != "/x/0-pic.png" {
 		t.Fatalf("images %v", images)
 	}
