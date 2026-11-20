@@ -263,7 +263,6 @@ func TestMirrorRebindRequiresUniqueRelocatedAnchor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fh.Close()
 	info, err := transcript.StatOpen(fh)
 	if err != nil {
 		t.Fatal(err)
@@ -279,7 +278,11 @@ func TestMirrorRebindRequiresUniqueRelocatedAnchor(t *testing.T) {
 	f := mirrorFile{src: source, tracker: tr}
 	proof, _, err := f.checkpoint(fh, info.Device, off, line, tr.Offset())
 	if err != nil || proof.AnchorEnd != off || len(proof.Anchor) == 0 {
+		fh.Close()
 		t.Fatalf("fixture failed to capture anchor at %d: %+v, %v", off, proof, err)
+	}
+	if err := fh.Close(); err != nil {
+		t.Fatal(err)
 	}
 	check := func() rebindResult {
 		t.Helper()
