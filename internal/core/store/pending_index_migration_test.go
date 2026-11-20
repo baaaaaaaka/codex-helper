@@ -16,6 +16,7 @@ func TestPendingIndexMigrationRollbackRetryAndCounts(t *testing.T) {
 		mustT(t, err)
 	}
 	restoreOldPendingIndex(t, s)
+	removeMirrorCheckpointSchema(t, s)
 	path := s.Path()
 	mustT(t, s.Close())
 	db, err := sql.Open("sqlite", path)

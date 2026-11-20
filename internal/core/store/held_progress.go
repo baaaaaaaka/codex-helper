@@ -36,3 +36,11 @@ func (s *Store) HeldProgressConversations() ([]int64, error) {
 func (s *Store) SettledProgressTurns(conv, before int64) ([]Turn, error) {
 	return collect(scanTurn)(s.r.QueryContext(context.Background(), `SELECT `+turnCols+` FROM turns WHERE id IN (SELECT DISTINCT hold_turn FROM outbox WHERE conv_id=? AND state IN ('queued','sending','unknown') AND hold_turn IS NOT NULL AND created_at<=?) AND state IN ('cancelled','failed','interrupted','not_started')`, conv, before))
 }
+
+// HasHeldProgress reports whether a conversation still has a final waiting
+// for its transcript. Call it in the same transaction that releases a final.
+func (t *Tx) HasHeldProgress(conv int64) (bool, error) {
+	var pending bool
+	err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id=? AND hold_turn IS NOT NULL AND state='queued')`, conv).Scan(&pending)
+	return pending, err
+}

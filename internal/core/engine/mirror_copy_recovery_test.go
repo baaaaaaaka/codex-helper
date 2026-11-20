@@ -11,8 +11,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/rollout"
 )
 
-// Recovery retains uncertain content instead of assuming it was delivered. The incomplete
-// ledger is injected only into a stopped, temporary test store.
+// An incomplete delivery ledger cannot turn a file copy into a history publish.
 func TestMirrorCopiedRolloutRecovery(t *testing.T) {
 	for _, tc := range []struct {
 		name                         string
@@ -128,15 +127,11 @@ func TestMirrorCopiedRolloutRecovery(t *testing.T) {
 				r.wait("new answer delivered", func() bool { return len(r.own(chat, "review new answer")) == 1 })
 			}
 			r.stop()
-			want := 1
-			if tc.replace && tc.missing {
-				want = 2
+			if n := len(r.own(chat, transcript.CompactText)); n != 1 {
+				t.Errorf("compaction posted %d times; want 1", n)
 			}
-			if n := len(r.own(chat, transcript.CompactText)); n != want {
-				t.Errorf("compaction posted %d times; want %d (missing ledger must recover content)", n, want)
-			}
-			if tc.replace && tc.missing && len(r.own(chat, "Recovered history")) != 1 {
-				t.Error("missing recovery label")
+			if len(r.own(chat, "Recovered history")) != 0 {
+				t.Error("file replacement published recovery history")
 			}
 			for _, s := range []string{"review old prompt", "review old answer", "review second prompt", "review second answer"} {
 				if n := len(r.own(chat, s)); n != 1 {

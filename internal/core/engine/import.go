@@ -143,7 +143,7 @@ func (e *Engine) queueImport(tx *store.Tx, job importJob) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		if exists && c.State != store.ConvClosed {
+		if exists && c.State != store.ConvClosed && !(job.Kind == importFull && e.historyBlocked(job.Conv, job.Thread)) {
 			return 0, errImportRunning
 		}
 		if err := tx.DeleteImportJob(prev.ID); err != nil {
@@ -302,8 +302,13 @@ func (e *Engine) importApplyOne(j importJob) bool {
 			if err := tx.RewindSource(id, job.Conv, store.SrcTracking); err != nil {
 				return err
 			}
-			if err := tx.SetMeta(realignKey(id), ""); err != nil {
+			if err := tx.DeleteMeta(realignKey(id)); err != nil {
 				return err
+			}
+			if job.Kind == importFull && !job.KeepTeams {
+				if err := tx.ApproveMirrorRecovery(job.Conv); err != nil {
+					return err
+				}
 			}
 		}
 		if src, _, err = tx.SourceByID(id); err != nil {
@@ -349,6 +354,9 @@ func (e *Engine) importApplyOne(j importJob) bool {
 			f.catchUpEnd = max(f.catchUpEnd, old.catchUpEnd)
 		}
 		f.tracker = e.mirrorTracker(f)
+		if old != nil {
+			e.setMirrorBlocked(old, false)
+		}
 		e.mirror.files[path] = f
 	}
 	delete(e.mirror.known, path)
@@ -815,7 +823,7 @@ func (e *Engine) cmdPublishHistory(j cmdJob, cs *convState, arg string) {
 		e.reply(j, "No local Codex history file is linked to this Work chat.", nil)
 		return
 	}
-	if job, running := e.importJobOf(conv); running {
+	if job, running := e.importJobOf(conv); running && !(full && e.historyBlocked(conv, src.ThreadID)) {
 		text := "History import is already running. Wait for `Import complete` before sending another task."
 		if full {
 			text = "History import is already running. Wait for `Import complete` before publishing full history."
@@ -835,11 +843,9 @@ func (e *Engine) cmdPublishHistory(j cmdJob, cs *convState, arg string) {
 		e.reply(j, textImportNothingNew, nil)
 		return
 	}
-	if full {
-		if v, _, err := e.st.Meta(fullHistKey(conv)); err == nil && v == "1" && src.Offset >= info.Size {
-			e.reply(j, "Full local Codex history is already published to this chat.", nil)
-			return
-		}
+	if full && e.fullHistoryPublished(src, info) {
+		e.reply(j, "Full local Codex history is already published to this chat.", nil)
+		return
 	}
 	queued := false
 	err = e.update(func(tx *store.Tx) error {
@@ -915,4 +921,24 @@ func (e *Engine) importBoundConv(tx *store.Tx, thread string) (int64, error) {
 		}
 	}
 	return 0, nil
+}
+
+// fullHistoryPublished also checks whether approval or replacement has
+// superseded the last full-history publication.
+func (e *Engine) fullHistoryPublished(src store.TranscriptSource, info transcript.FileInfo) bool {
+	if src.Offset < info.Size || src.Size != info.Size || src.Inode != info.Inode ||
+		src.MTime != ms(info.MTime) || e.historyBlocked(src.ConvID, src.ThreadID) {
+		return false
+	}
+	v, _, err := e.st.Meta(fullHistKey(src.ConvID))
+	if err != nil || v != "1" {
+		return false
+	}
+	var pending int
+	err = e.st.Read(func(tx *store.Tx) error {
+		var err error
+		pending, err = tx.MirrorRecoveryReviewCount(src.ConvID)
+		return err
+	})
+	return err == nil && pending == 0
 }

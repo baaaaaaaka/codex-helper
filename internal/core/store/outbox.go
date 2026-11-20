@@ -196,7 +196,8 @@ func (t *Tx) MarkUnknown(id int64, note string) error {
 // (authoritative read-back absence) to queued. at=0 means due now.
 func (t *Tx) Requeue(id int64, at int64) error {
 	return t.outMove(id, []string{OutSending, OutUnknown},
-		`state = 'queued', next_attempt_at = ?, attempt_token = NULL`, nullInt(at))
+		`state = CASE WHEN recovery_review=1 THEN 'dropped' ELSE 'queued' END,
+		next_attempt_at = ?, attempt_token = CASE WHEN recovery_review=1 THEN attempt_token END`, nullInt(at))
 }
 
 // Drop gives up on a pending row.

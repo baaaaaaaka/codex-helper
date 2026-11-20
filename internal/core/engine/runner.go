@@ -506,7 +506,7 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		}
 	}
 	transcriptProgress := false
-	if a, ok := e.ag.(TranscriptAgent); ok && a.TranscriptProgress() && e.cfg.SessionsDir != "" && kind == store.KindWork && rs.request == "" {
+	if a, ok := e.ag.(TranscriptAgent); ok && a.TranscriptProgress() && e.cfg.SessionsDir != "" && kind == store.KindWork && rs.request == "" && !e.historyBlocked(id, req.ThreadID) {
 		// Persist ownership before allowing the agent to write any record.
 		if err := e.persist(ctx, "assign transcript progress", func(tx *store.Tx) error { return tx.SetTranscriptProgress(tr.ID) }); err != nil {
 			e.logf("assign progress of %s: %v", label, err)

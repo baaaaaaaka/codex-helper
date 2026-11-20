@@ -270,13 +270,14 @@ func TestMirrorStatIsTiered(t *testing.T) {
 		stats[p] = append(stats[p], now)
 		return infos[p], nil
 	}
-	e.mirror = &mirrorState{files: map[string]*mirrorFile{}, known: map[string]string{}}
+	e.mirror = &mirrorState{files: map[string]*mirrorFile{}, known: map[string]string{}, blocked: map[int64]map[string]blockedMirrorThread{}}
 	add := func(path string, conv int64, cs *convState, mtime time.Time) {
 		e.convs[conv] = cs
 		info := transcript.FileInfo{Size: 100, MTime: mtime, Inode: 1}
 		infos[path] = info
 		e.mirror.files[path] = &mirrorFile{src: store.TranscriptSource{Path: path, ConvID: conv},
-			tracker: transcript.NewTracker("t", 100, 1, nil), info: info}
+			tracker: transcript.NewTracker("t", 100, 1, nil), info: info,
+			proof: store.MirrorCheckpoint{ReadEnd: 100, Window: make([]byte, 32)}}
 	}
 	missing := filepath.Join(t.TempDir(), "missing")
 	hot, running, idle, parked := missing+"-hot", missing+"-running", missing+"-idle", missing+"-parked"
@@ -622,40 +623,39 @@ func TestAbandonedTurnOfAnOlderCodexIsCaughtUp(t *testing.T) {
 }
 
 // W1c: the store keeps a rollout's mtime in milliseconds. A tracked rollout
-// restored at start-up, unchanged since, must compare equal to its
-// nanosecond stat and not be read again: before the fix every tracked
-// rollout was read, and committed its own transaction, on each start.
-// mirrorRead drops the file of a closed conversation, which shows here
-// whether it was called.
+// Persisted millisecond times must compare equal to their corresponding
+// filesystem timestamps. Otherwise each startup reads and commits idle files.
 func TestRestoredRolloutWithMillisecondMTimeIsNotReadAgain(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	e := &Engine{t: ProductionTiming(), now: func() time.Time { return now }, log: io.Discard, convs: map[int64]*convState{}}
-	e.mirror = &mirrorState{files: map[string]*mirrorFile{}, known: map[string]string{}}
-	e.convs[1] = &convState{kind: store.KindWork, state: store.ConvClosed}
-	mtime := now.Add(-time.Hour).Add(123_456_789 * time.Nanosecond) // sub-millisecond part
-	stat := transcript.FileInfo{Size: 100, MTime: mtime, Inode: 7}
+	e.mirror = &mirrorState{files: map[string]*mirrorFile{}, known: map[string]string{}, blocked: map[int64]map[string]blockedMirrorThread{}}
+	e.convs[1] = &convState{kind: store.KindWork, state: store.ConvParked}
+	mtime := now.Add(-time.Hour).Add(123_456_789 * time.Nanosecond)
+	info := transcript.FileInfo{Size: 100, MTime: mtime, Inode: 7, Device: 2}
 	stats := 0
-	e.statFile = func(string) (transcript.FileInfo, error) { stats++; return stat, nil }
+	e.statFile = func(string) (transcript.FileInfo, error) { stats++; return info, nil }
 	path := filepath.Join(t.TempDir(), "rollout.jsonl")
-	restore := func() {
-		e.mirror.files[path] = &mirrorFile{src: store.TranscriptSource{Path: path, ConvID: 1, Size: 100, MTime: ms(mtime), Inode: 7},
-			tracker: transcript.NewTracker("t", 100, 1, nil),
-			info:    transcript.FileInfo{Size: 100, MTime: fromMS(ms(mtime)), Inode: 7}} // as mirrorInit restores it
+	f := &mirrorFile{
+		src:     store.TranscriptSource{Path: path, ConvID: 1, Offset: 100, Size: 100, MTime: ms(mtime), Inode: 7},
+		tracker: transcript.NewTracker("t", 100, 1, nil),
+		info:    transcript.FileInfo{Size: 100, MTime: fromMS(ms(mtime)), Inode: 7, Device: 2},
+		proof:   store.MirrorCheckpoint{Device: 2, ReadEnd: 100, Window: make([]byte, 32)},
 	}
-	restore()
+	e.mirror.files[path] = f
+	// No store or file is available in this fixture. The idle path needs
+	// neither, and leaves the trusted checkpoint in place.
 	e.mirrorPoll(context.Background())
-	if stats != 1 {
-		t.Fatalf("stat'ed %d times, want 1", stats)
+	if stats != 1 || f.blocked || e.mirror.files[path] != f {
+		t.Fatalf("unchanged restored rollout: stats=%d blocked=%t", stats, f.blocked)
 	}
-	if _, ok := e.mirror.files[path]; !ok {
-		t.Fatalf("an unchanged restored rollout was read again")
+	changed := info
+	changed.MTime = mtime.Add(time.Second)
+	if sameFile(changed, f.info) {
+		t.Fatal("same-size rewrite with newer mtime compared equal")
 	}
-
-	// A real change (a later mtime, same size) is still read.
-	stat.MTime = mtime.Add(time.Second)
-	restore()
-	e.mirrorPoll(context.Background())
-	if _, ok := e.mirror.files[path]; ok {
-		t.Fatalf("a rollout with a newer mtime was not read")
+	changed = info
+	changed.Device++
+	if sameFile(changed, f.info) || !mirrorIdentityChanged(f.proof, f.src, changed, 100) {
+		t.Fatal("same inode on a different device compared equal")
 	}
 }

@@ -143,9 +143,10 @@ func readLine(r *bufio.Reader) (data []byte, n int64, over, cut, complete bool, 
 
 // FileInfo is what the mirror compares between scans.
 type FileInfo struct {
-	Size  int64
-	MTime time.Time
-	Inode int64
+	Size   int64
+	MTime  time.Time
+	Inode  int64
+	Device int64
 }
 
 // Stat returns the size, modification time and file identity of path: the
@@ -155,7 +156,18 @@ func Stat(path string) (FileInfo, error) {
 	if err != nil {
 		return FileInfo{}, err
 	}
-	return FileInfo{Size: st.Size(), MTime: st.ModTime(), Inode: fileID(path, st)}, nil
+	device, inode := statIdentity(path, st)
+	return FileInfo{Size: st.Size(), MTime: st.ModTime(), Inode: inode, Device: device}, nil
+}
+
+// StatOpen obtains identity and metadata from the handle used to read records.
+func StatOpen(f *os.File) (FileInfo, error) {
+	st, err := f.Stat()
+	if err != nil {
+		return FileInfo{}, err
+	}
+	device, inode := fileIdentity(f, st)
+	return FileInfo{Size: st.Size(), MTime: st.ModTime(), Inode: inode, Device: device}, nil
 }
 
 // Rewritten reports whether a file was replaced or truncated since it was

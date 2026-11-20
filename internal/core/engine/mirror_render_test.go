@@ -150,12 +150,12 @@ func TestMirrorArtifactFailuresAndHistoryHideManifest(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "result.txt"), []byte("result"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	replayed, err := e.renderMirrorMode(context.Background(), 2, "thread", o, false, false, true)
+	replayed, err := e.renderMirrorMode(context.Background(), 2, "thread", o, false, true)
 	if err != nil || len(replayed) != 1 || strings.Contains(replayed[0].Body, "result.txt") || replayed[0].File != nil {
 		t.Fatalf("history: %v, %v", replayed, err)
 	}
-	recovered, err := e.renderMirrorMode(context.Background(), 2, "thread", o, false, true, false)
-	if err != nil || len(recovered) != 2 || recovered[1].File == nil {
-		t.Fatalf("recovery: %v, %v", recovered, err)
+	catchUp, err := e.renderMirrorMode(context.Background(), 2, "thread", o, false, false)
+	if err != nil || len(catchUp) != 2 || catchUp[1].File == nil {
+		t.Fatalf("catch-up: %v, %v", catchUp, err)
 	}
 }

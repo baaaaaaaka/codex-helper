@@ -107,6 +107,7 @@ type Tracker struct {
 	skip           Skip
 	helperProgress func(string, string) bool
 
+	boundary  BoundaryTracker
 	off, line int64 // next read position
 	turn      *openTurn
 	prev      *openTurn    // the last closed turn: a compaction between turns belongs to it
@@ -261,6 +262,7 @@ func (t *Tracker) Resume() (offset, line int64) {
 // not hide an earlier missing one.
 func (t *Tracker) Restart() {
 	t.off, t.line, t.turn, t.prev, t.held = 0, 0, nil, nil, nil
+	t.boundary = BoundaryTracker{}
 }
 
 // Advance consumes bytes that were skipped without lines (alignment).
@@ -285,6 +287,9 @@ func (t *Tracker) Feed(lines []Line) []Output {
 		ev := ParseLine(l)
 		if !ev.Time.IsZero() && ev.Time.After(t.last) {
 			t.last = ev.Time
+		}
+		if ev.ThreadID == "" || ev.ThreadID == t.threadID {
+			t.boundary.Observe(ev, l.End, t.line)
 		}
 		n := len(out)
 		out = t.apply(out, ev, l)
