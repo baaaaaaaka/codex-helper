@@ -385,26 +385,27 @@ func newSkillsManager(root *rootOptions, codexDir string, out io.Writer) (*skill
 	if err != nil {
 		return nil, err
 	}
-	return newSkillsManagerForPaths(paths, out)
+	return newSkillsManagerForPaths(paths, out, false)
 }
 
-func newSkillsManagerForPaths(paths effectivePaths, out io.Writer) (*skills.Manager, error) {
+func newSkillsManagerForPaths(paths effectivePaths, out io.Writer, detachGitTerminal bool) (*skills.Manager, error) {
 	cacheDir, err := defaultSkillsCacheDir()
 	if err != nil {
 		return nil, err
 	}
 	return skills.NewManager(skills.ManagerOptions{
-		ConfigDir: filepath.Dir(paths.ConfigPath),
-		CacheDir:  cacheDir,
-		CodexDir:  paths.CodexDir,
-		HomeDir:   paths.Home,
-		Out:       out,
+		ConfigDir:         filepath.Dir(paths.ConfigPath),
+		CacheDir:          cacheDir,
+		CodexDir:          paths.CodexDir,
+		HomeDir:           paths.Home,
+		Out:               out,
+		DetachGitTerminal: detachGitTerminal,
 	})
 }
 
 func startSkillsDailyAutoSync(ctx context.Context, paths effectivePaths) <-chan struct{} {
 	finished := make(chan struct{})
-	mgr, err := newSkillsManagerForPaths(paths, io.Discard)
+	mgr, err := newSkillsManagerForPaths(paths, io.Discard, true)
 	if err != nil {
 		close(finished)
 		return finished

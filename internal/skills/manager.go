@@ -24,12 +24,13 @@ type Manager struct {
 }
 
 type ManagerOptions struct {
-	ConfigDir string
-	CacheDir  string
-	CodexDir  string
-	HomeDir   string
-	Git       GitRunner
-	Out       io.Writer
+	ConfigDir         string
+	CacheDir          string
+	CodexDir          string
+	HomeDir           string
+	Git               GitRunner
+	Out               io.Writer
+	DetachGitTerminal bool
 }
 
 func NewManager(opts ManagerOptions) (*Manager, error) {
@@ -65,7 +66,7 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 	}
 	git := opts.Git
 	if git == nil {
-		git = ExecGitRunner{Timeout: 2 * time.Minute}
+		git = ExecGitRunner{Timeout: 2 * time.Minute, detachTerminal: opts.DetachGitTerminal}
 	}
 	out := opts.Out
 	if out == nil {
