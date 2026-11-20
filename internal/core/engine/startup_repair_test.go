@@ -214,8 +214,13 @@ func TestManyUnannouncedChatsAnnouncedInBatches(t *testing.T) {
 	}
 	st.Close()
 	r.start()
-	ctl := r.control()
-	r.wait("summaries", func() bool { return len(r.own(ctl, "New local Codex chats (45, part")) == 3 })
+	// Starting 45 chats under the race detector can take longer on a busy CI runner.
+	var ctl string
+	r.waitFor("control chat", 30*time.Second, func() bool {
+		ctl = r.chatOf("control")
+		return ctl != "" && len(r.own(ctl, "control chat is ready")) == 1
+	})
+	r.waitFor("summaries", 30*time.Second, func() bool { return len(r.own(ctl, "New local Codex chats (45, part")) == 3 })
 	listed := map[string]int{}
 	for i, m := range r.own(ctl, "New local Codex chats") {
 		if m.MentionsOwner != (i == 0) {
