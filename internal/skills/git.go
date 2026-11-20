@@ -20,6 +20,8 @@ type GitRunner interface {
 type ExecGitRunner struct {
 	GitPath string
 	Timeout time.Duration
+
+	detachTerminal bool
 }
 
 type GitError struct {
@@ -56,6 +58,13 @@ func (r ExecGitRunner) Run(ctx context.Context, dir string, env []string, args .
 		cmd.Dir = dir
 	}
 	cmd.Env = safeGitEnv(env)
+	if r.detachTerminal {
+		// Git's prompt setting does not stop SSH from opening the terminal
+		// directly. Disconnect it and suppress OpenSSH's askpass fallback.
+		cmd.Env = append(cmd.Env, "SSH_ASKPASS_REQUIRE=never")
+		detachGitCommand(cmd)
+		cmd.WaitDelay = time.Second
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
