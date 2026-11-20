@@ -612,7 +612,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.legacyCheckLoop, e.recoverGoalStops,
 	}
 	if e.cfg.SessionsDir != "" {
-		loops = append(loops, e.mirrorLoop, e.historyCheckLoop)
+		loops = append(loops, e.mirrorLoop, e.historyCheckLoop, e.mirrorGapLoop)
 	}
 	if e.scanner != nil {
 		loops = append(loops, e.scanLoop)

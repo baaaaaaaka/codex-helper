@@ -14,6 +14,7 @@ func TestTokenIndexConversionRollbackAndRetryPreservesDelivery(t *testing.T) {
 		_, err := s.w.Exec(`INSERT INTO outbox(conv_id,delivery_key,seq,kind,body,state,attempt_token,created_at) VALUES(?,?,?,'final','original JSON payload',?,'old-token',1)`, conv, fmt.Sprint(i), i+1, state)
 		mustT(t, err)
 	}
+	removeMirrorCheckpointSchema(t, s)
 	path := s.Path()
 	mustT(t, s.Close())
 	db, err := sql.Open("sqlite", path)

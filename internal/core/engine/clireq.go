@@ -646,8 +646,11 @@ func (e *Engine) cliAnnounce(tx *store.Tx, id string, conv int64, control bool, 
 func (e *Engine) cliAwaitImport(ctx context.Context, conv, id int64) error {
 	for {
 		j, ok := e.importJobOf(conv)
-		if !ok || j.ID != id {
+		if !ok {
 			return nil
+		}
+		if j.ID != id {
+			return errors.New("history import was replaced by a newer request")
 		}
 		if err := e.cliSleep(ctx, e.t.Tick); err != nil {
 			return err
@@ -680,17 +683,15 @@ func (e *Engine) cliPublishHistory(ctx context.Context, r CLIRequest, p *cliProg
 		if !ok {
 			return cliFail("local Codex transcript not found for session %s", label)
 		}
-		if _, running := e.importJobOf(id); running {
+		if _, running := e.importJobOf(id); running && !e.historyBlocked(id, src.ThreadID) {
 			return cliFail("a history import is still running for session %s; wait for `Import complete` and retry", label)
 		}
 		info, err := e.statFile(src.Path)
 		if err != nil {
 			return cliFail("local Codex transcript not found for session %s", label)
 		}
-		if !r.Force {
-			if v, _, err := e.st.Meta(fullHistKey(id)); err == nil && v == "1" && src.Offset >= info.Size {
-				return CLIResult{Lines: []string{"Full local Codex history is already published to this Teams chat."}}, nil
-			}
+		if !r.Force && e.fullHistoryPublished(src, info) {
+			return CLIResult{Lines: []string{"Full local Codex history is already published to this Teams chat."}}, nil
 		}
 		title := e.sessionTitleOf(src.Path, src.ThreadID) // reads the store: not inside the transaction
 		running := false

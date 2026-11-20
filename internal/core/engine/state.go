@@ -15,7 +15,7 @@ const (
 	metaGroupPrefix    = "engine_group:"          // + conv id: "1" for a chat with other people
 	metaNextLabel      = "engine_next_label"      // next sNNN number
 	metaMirrorInit     = "engine_mirror_initialized"
-	metaRealignPrefix  = "engine_realign:" // + source id: unix ms of the realign point while a rewritten rollout is re-read
+	metaRealignPrefix  = "engine_realign:" // + source id: legacy realignment boundary or timestamp
 	metaRehashed       = "engine_legacy_rehashed"
 	metaInbox          = "engine_inbox_conv" // conversation id of the delegation inbox
 	// metaDiscoveredPrefix + conversation id: a work conversation the

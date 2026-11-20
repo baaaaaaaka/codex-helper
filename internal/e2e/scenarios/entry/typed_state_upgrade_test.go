@@ -18,7 +18,7 @@ import (
 // Unlike rc.59 conversion, this exercises the actual CLI's in-place upgrade
 // of a frozen core v5 database, then runs without any legacy authority.
 func TestEntryTypedSQLiteUpgradePreservesAttemptedNotice(t *testing.T) {
-	const expectedSchemaVersion = 13 // External upgrade contract, independent of the implementation package.
+	const expectedSchemaVersion = 14 // External upgrade contract, independent of the implementation package.
 	harness.Parallel(t)
 	path := filepath.Join(t.TempDir(), "core.sqlite")
 	s := harness.NewScenario(t, "ENTRY-TYPED-SQLITE-UPGRADE", harness.Options{
@@ -77,7 +77,7 @@ func TestEntryTypedSQLiteUpgradePreservesAttemptedNotice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var version, oldKeys, recoveryTables, goalTables, deliveryIndexes int
+	var version, oldKeys, recoveryTables, goalTables, deliveryIndexes, checkpoints int
 	var result string
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
@@ -94,10 +94,13 @@ func TestEntryTypedSQLiteUpgradePreservesAttemptedNotice(t *testing.T) {
 	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='index' AND (name='outbox_token' OR (name='outbox_pending' AND replace(sql,' ','') LIKE '%conv_id,seq,state%'))`).Scan(&deliveryIndexes); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='mirror_checkpoints'`).Scan(&checkpoints); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.QueryRow(`SELECT text FROM cli_result_lines WHERE request_id='completed' AND position=0`).Scan(&result); err != nil {
 		t.Fatal(err)
 	}
-	s.Check("upgrade committed typed state and removed old keys", version == expectedSchemaVersion && recoveryTables == 1 && goalTables == 1 && deliveryIndexes == 2 && oldKeys == 0 && result == "original result", fmt.Sprintf("v%d; recovery and goal control tables; both delivery indexes; no old keys; original result", expectedSchemaVersion), fmt.Sprintf("version=%d recovery_tables=%d goal_tables=%d delivery_indexes=%d old=%d result=%q", version, recoveryTables, goalTables, deliveryIndexes, oldKeys, result))
+	s.Check("upgrade committed typed state and removed old keys", version == expectedSchemaVersion && recoveryTables == 1 && goalTables == 1 && deliveryIndexes == 2 && checkpoints == 1 && oldKeys == 0 && result == "original result", fmt.Sprintf("v%d; recovery and goal control tables; both delivery indexes; mirror checkpoint table; no old keys; original result", expectedSchemaVersion), fmt.Sprintf("version=%d recovery_tables=%d goal_tables=%d delivery_indexes=%d checkpoint_tables=%d old=%d result=%q", version, recoveryTables, goalTables, deliveryIndexes, checkpoints, oldKeys, result))
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}

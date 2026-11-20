@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +38,10 @@ type mirrorState struct {
 	progressTurns   map[string]int64
 	skipTurns       map[string]bool // helper-owned Codex turn id -> shared transport
 	files           map[string]*mirrorFile
+	blocked         map[int64]map[string]blockedMirrorThread
+	rebindJobs      chan rebindRequest
+	rebindActive    chan rebindRequest
+	rebindResults   chan rebindResult
 	known           map[string]string // path -> state of untracked sources (baseline/ignored/missing)
 	// checked: the file state of each baseline rollout the last discovery
 	// pass looked at and left as baseline; an unchanged file is skipped
@@ -89,14 +95,20 @@ const dirSettle = 5 * time.Second
 const oldWalkFiles = 256
 
 type mirrorFile struct {
-	src     store.TranscriptSource
-	tracker *transcript.Tracker
-	info    transcript.FileInfo
-	// recoveryEnd is the fixed end seen when this file was replaced. Missing
-	// outputs through it are recovered, not new activity. Keep the boundary
-	// after EOF: a held output can be released by a later appended record.
-	// -1 restores the old timestamp-only realignment marker on first stat.
-	recoveryEnd int64
+	src           store.TranscriptSource
+	tracker       *transcript.Tracker
+	info          transcript.FileInfo
+	proof         store.MirrorCheckpoint
+	proofHash     mirrorHash
+	openVerified  bool
+	blocked       bool
+	legacyRealign bool
+	rebindPending bool
+	rebindTried   bool
+	rebindRetry   bool
+	rebindAt      transcript.FileInfo
+	rebindNext    time.Time
+	rebindDelay   time.Duration
 	// fails and retryAt back off a rollout whose records failed to render
 	// (review M7); the records are re-read, never dropped.
 	fails   int
@@ -119,7 +131,7 @@ type mirrorFile struct {
 	ns        string
 	keepTeams int64
 	// An explicit history import displays past answers without sending
-	// their files again. Startup catch-up and recovery can still send files.
+	// their files again. Startup catch-up still can send files.
 	historyEnd int64
 	// infoSaved is the tracker settings last persisted.
 	infoSaved store.SourceInfo
@@ -145,6 +157,15 @@ func catchUpFrom(at transcript.FileInfo, atStart bool) int64 {
 }
 
 func realignKey(srcID int64) string { return fmt.Sprintf("%s%d", metaRealignPrefix, srcID) }
+
+func interruptedMirrorRealign(marker string, off int64) bool {
+	if marker == "" {
+		return false
+	}
+	end, ok := strings.CutPrefix(marker, "end:")
+	n, err := strconv.ParseInt(end, 10, 64)
+	return !ok || err != nil || n <= 0 || off < n
+}
 
 // restoreInfo seeds a resumed tracker from typed, last-observed settings.
 func (e *Engine) restoreInfo(f *mirrorFile, t *transcript.Tracker) {
@@ -217,6 +238,21 @@ func (e *Engine) mirrorInit() error {
 		return err
 	}
 	m.skipTurns = ids
+	m.blocked = make(map[int64]map[string]blockedMirrorThread)
+	m.rebindActive = make(chan rebindRequest, 2)
+	m.rebindResults = make(chan rebindResult)
+	proofs, err := e.st.MirrorCheckpoints()
+	if err != nil {
+		return err
+	}
+	var legacy map[string]string
+	if err := e.st.Read(func(tx *store.Tx) error {
+		var err error
+		legacy, err = tx.MetaPrefix(metaRealignPrefix)
+		return err
+	}); err != nil {
+		return err
+	}
 	m.progressTurns, m.progressClients, err = e.st.TranscriptProgressTurns()
 	if err != nil {
 		return err
@@ -238,6 +274,10 @@ func (e *Engine) mirrorInit() error {
 	if err != nil {
 		return err
 	}
+	// A directory move can change every identity in the same tick. Keep
+	// one small request per known file, up to the cap, so the worker can
+	// drain the checks without waiting for the parked stat interval.
+	m.rebindJobs = make(chan rebindRequest, min(max(len(srcs), 16), 1024))
 	e.mirror = m
 	e.importLoad() // import.go
 	for _, s := range srcs {
@@ -248,15 +288,13 @@ func (e *Engine) mirrorInit() error {
 			}
 			continue
 		}
-		f := &mirrorFile{src: s, tracker: e.newMirrorTracker(s.ThreadID, s.Offset, s.Line, e.mirrorSkip),
-			info: transcript.FileInfo{Size: s.Size, MTime: fromMS(s.MTime), Inode: s.Inode}}
-		if v, _, err := e.st.Meta(realignKey(s.ID)); err == nil && v != "" {
-			f.recoveryEnd = -1
-			if strings.HasPrefix(v, "end:") {
-				if _, err := fmt.Sscan(strings.TrimPrefix(v, "end:"), &f.recoveryEnd); err != nil || f.recoveryEnd < 0 {
-					f.recoveryEnd = -1
-				}
-			}
+		proof := proofs[s.ID]
+		f := &mirrorFile{src: s, tracker: e.newMirrorTracker(s.ThreadID, s.Offset, s.Line, e.mirrorSkip), proof: proof,
+			info:          transcript.FileInfo{Size: s.Size, MTime: fromMS(s.MTime), Inode: s.Inode, Device: proof.Device},
+			legacyRealign: interruptedMirrorRealign(legacy[realignKey(s.ID)], s.Offset)}
+		if f.legacyRealign {
+			e.mirrorBlocked(f, true)
+			e.logf("mirror: %s paused after interrupted legacy recovery (chat %d); review before running helper publish-history full", filepath.Base(s.Path), s.ConvID)
 		}
 		e.restoreInfo(f, f.tracker)
 		e.importRestore(f) // import.go
@@ -283,6 +321,12 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 			return
 		}
 	}
+	// A slow verification never holds the mirror or the Teams sender.
+	var verify sync.WaitGroup
+	verifyCtx, cancelVerify := context.WithCancel(ctx)
+	verify.Go(func() { e.mirrorVerifyLoop(verifyCtx, e.mirror.rebindJobs) })
+	verify.Go(func() { e.mirrorVerifyLoop(verifyCtx, e.mirror.rebindActive) })
+	defer func() { cancelVerify(); verify.Wait() }()
 	e.startFirstWalk()
 	var discoverAfter time.Time
 	stat := time.NewTicker(e.t.MirrorStat)
@@ -304,6 +348,8 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 				e.discover(ctx)
 				discoverAfter = e.now().Add(e.t.MirrorStat)
 			}
+		case result := <-e.mirror.rebindResults:
+			e.applyMirrorRebind(result)
 		case <-e.historyWake:
 			e.mirrorHistory() // a resume history check was decided
 		case <-disc.C:
@@ -328,7 +374,7 @@ func (e *Engine) catchUpPending() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, f := range m.files {
-		if f.catchUpSet && f.tracker.Offset() < f.catchUpEnd {
+		if !f.blocked && f.catchUpSet && f.tracker.Offset() < f.catchUpEnd {
 			return true
 		}
 	}
@@ -842,6 +888,10 @@ func (e *Engine) mirrorPoll(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		if !e.convOpen(f.src.ConvID) {
+			e.removeMirrorFile(f)
+			continue
+		}
 		first := f.nextStat.IsZero()
 		info, err := e.statFile(f.src.Path)
 		mtime := f.info.MTime
@@ -856,6 +906,7 @@ func (e *Engine) mirrorPoll(ctx context.Context) {
 			f.nextStat = now.Add(time.Duration(pathHash(f.src.Path) % uint64(every)))
 		}
 		if err != nil {
+			e.mirrorBlocked(f, true)
 			continue // removed or unreadable; keep the row
 		}
 		if !f.catchUpSet {
@@ -866,15 +917,23 @@ func (e *Engine) mirrorPoll(ctx context.Context) {
 				f.catchUpEnd = info.Size
 			}
 		}
+		if f.legacyRealign {
+			continue
+		}
+		if mirrorIdentityChanged(f.proof, f.src, info, f.tracker.Offset()) {
+			e.queueMirrorRebind(f, info)
+			continue
+		}
+		if f.blocked && f.rebindTried && sameMirrorIdentity(info, f.rebindAt) {
+			e.queueMirrorRebind(f, info)
+			continue
+		}
 		if f.held {
 			continue
 		}
-		if sameFile(info, f.info) && f.tracker.Offset() >= info.Size {
+		if len(f.proof.Window) != 0 && sameFile(info, f.info) && f.tracker.Offset() >= info.Size {
+			e.mirrorBlocked(f, false)
 			e.settleProgressAtEOF(f, info, now)
-			continue
-		}
-		if !e.convOpen(f.src.ConvID) {
-			e.mirrorRead(ctx, f, info)
 			continue
 		}
 		if now.Before(f.retryAt) {
@@ -896,7 +955,7 @@ func (e *Engine) mirrorPoll(ctx context.Context) {
 // compares equal to its nanosecond stat, so an unchanged rollout is not
 // read again, with its own transaction, on every helper start.
 func sameFile(a, b transcript.FileInfo) bool {
-	return a.Size == b.Size && a.Inode == b.Inode && ms(a.MTime) == ms(b.MTime)
+	return a.Size == b.Size && sameMirrorIdentity(a, b) && ms(a.MTime) == ms(b.MTime)
 }
 
 // mirrorStatEvery is the stat period of a tracked rollout last modified at
@@ -914,7 +973,7 @@ func (e *Engine) mirrorStatEvery(conv int64, mtime, now time.Time) time.Duration
 	switch {
 	case cs == nil:
 		return e.t.MirrorIdleStat
-	case cs.running != nil:
+	case cs.running != nil || cs.transcriptOpen:
 		return e.t.MirrorStat
 	case cs.state == store.ConvParked:
 		return e.t.MirrorParkedStat
@@ -932,33 +991,47 @@ func pathHash(p string) uint64 {
 	return h
 }
 
+func (e *Engine) removeMirrorFile(f *mirrorFile) {
+	e.mirror.mu.Lock()
+	defer e.mirror.mu.Unlock()
+	e.setMirrorBlocked(f, false)
+	delete(e.mirror.files, f.src.Path)
+	e.mirror.known[f.src.Path] = store.SrcIgnored
+}
+
 // mirrorRead reads new records of one rollout and posts them.
 func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.FileInfo) {
 	if !e.convOpen(f.src.ConvID) {
-		e.mirror.mu.Lock()
-		delete(e.mirror.files, f.src.Path)
-		e.mirror.known[f.src.Path] = store.SrcIgnored
-		e.mirror.mu.Unlock()
+		e.removeMirrorFile(f)
 		return
 	}
-	// A shrink below the read offset needs no inode (Windows: the file
-	// index stands in for it, see transcript.Stat).
-	rewritten := transcript.Rewritten(info, f.tracker.Offset(), f.src.Inode)
-	recoveryEnd := f.recoveryEnd
-	if rewritten {
-		e.logf("mirror: %s was rewritten; realigning", filepath.Base(f.src.Path))
-		f.tracker.Restart()
-		recoveryEnd = info.Size
-		f.proven = 0 // offsets of the old file
+	if f.legacyRealign {
+		return
 	}
-	if recoveryEnd < 0 {
-		recoveryEnd = info.Size // upgrade an interrupted legacy realignment
+	if mirrorIdentityChanged(f.proof, f.src, info, f.tracker.Offset()) ||
+		(!f.openVerified && f.proof.ReadEnd > f.src.Offset) {
+		e.queueMirrorRebind(f, info)
+		return
 	}
-	recovery := func(o transcript.Output) bool { return recoveryEnd > 0 && o.End <= recoveryEnd }
 	fh, err := os.Open(f.src.Path)
 	if err != nil {
+		e.mirrorBlocked(f, true)
 		return
 	}
+	defer fh.Close()
+	actual, err := transcript.StatOpen(fh)
+	if err != nil || !sameMirrorIdentity(actual, info) || actual.Size < info.Size {
+		return // path changed between stat and open
+	}
+	info = actual
+	if len(f.proof.Window) != 0 {
+		window, err := mirrorWindow(fh, f.src.Offset)
+		if err != nil || !bytes.Equal(window, f.proof.Window) {
+			e.queueMirrorRebind(f, info)
+			return
+		}
+	}
+	e.mirrorBlocked(f, false)
 	var outs []transcript.Output
 	read := int64(0)
 	records := 0
@@ -966,7 +1039,8 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		lines, next, err := transcript.ReadLimited(fh, f.tracker.Offset(), mirrorChunk, mirrorRecordsMax-records)
 		if err != nil {
 			e.logf("mirror read %s: %v", filepath.Base(f.src.Path), err)
-			break
+			f.tracker = e.mirrorTracker(f)
+			return
 		}
 		if len(lines) == 0 {
 			f.tracker.Advance(next)
@@ -977,7 +1051,6 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		f.tracker.Advance(next)
 		read += next - lines[0].Off
 	}
-	fh.Close()
 	if f.tracker.Offset() >= info.Size && info.MTime.Before(e.mirror.startedAt) {
 		// At the end of a rollout unchanged since before the start: no
 		// record will decide a turn still held (abandoned, s671).
@@ -1016,7 +1089,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		if complete {
 			continue
 		}
-		msgs, err := e.renderMirrorMode(ctx, f.src.ConvID, thread, o, !f.catchingUp(o) && !recovery(o), recovery(o), o.End <= f.historyEnd)
+		msgs, err := e.renderMirrorMode(ctx, f.src.ConvID, thread, o, !f.catchingUp(o), o.End <= f.historyEnd)
 		if err != nil {
 			// Re-read these records from the persisted position after a
 			// backoff (review M7): never lose them.
@@ -1038,6 +1111,29 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	off, line := f.tracker.Resume()
 	if off == 0 && f.src.Offset > 0 {
 		off = 1 // the store never moves a source back to 0; 1 re-aligns to line 2
+	}
+	var proof store.MirrorCheckpoint
+	proofHash := f.proofHash
+	hasProof := f.tracker.Offset() >= f.proof.ReadEnd &&
+		(len(f.proof.Window) == 0 || off != f.src.Offset || f.tracker.Offset() != f.proof.ReadEnd || f.proof.Device != info.Device)
+	switch {
+	case hasProof:
+		proof, proofHash, err = f.checkpoint(fh, info.Device, off, line, f.tracker.Offset())
+	case f.tracker.Offset() < f.proof.ReadEnd:
+		proofHash, err = f.proofHash.extend(fh, f.src.Offset, f.tracker.Offset())
+		off, line = f.src.Offset, f.src.Line
+	}
+	if err != nil {
+		e.logf("mirror checkpoint %s: %v", filepath.Base(f.src.Path), err)
+		f.tracker = e.mirrorTracker(f)
+		return
+	}
+	// Check the opened object again before committing positions from it.
+	after, err := transcript.StatOpen(fh)
+	if err != nil || !sameMirrorIdentity(after, info) || after.Size < info.Size ||
+		(after.Size == info.Size && !after.MTime.Equal(info.MTime)) {
+		f.tracker = e.mirrorTracker(f)
+		return
 	}
 	woke, created := false, false
 	e.mu.Lock()
@@ -1077,6 +1173,20 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 				released = true
 				continue
 			}
+			if r.o.Kind == transcript.OutputStatus || r.o.Kind == transcript.OutputCompact {
+				e.mirror.mu.Lock()
+				local := e.mirror.progressTurns[r.o.TurnID]
+				e.mirror.mu.Unlock()
+				if local != 0 {
+					gap, err := tx.TranscriptProgressGap(local)
+					if err != nil {
+						return err
+					}
+					if gap {
+						continue
+					}
+				}
+			}
 			ok, err := tx.RecordedParts(r.msgs)
 			if err != nil {
 				return err
@@ -1084,7 +1194,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 			if ok {
 				continue
 			}
-			live := !f.catchingUp(r.o) && !recovery(r.o)
+			live := !f.catchingUp(r.o)
 			if posted == 0 {
 				firstLive = live
 			}
@@ -1092,7 +1202,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 			if live && len(r.msgs) > 0 && r.o.Kind == transcript.OutputStatus {
 				nativeProgressTurn = r.o.TurnID
 			}
-			localActivity = localActivity || (!recovery(r.o) && len(r.msgs) > 0)
+			localActivity = localActivity || len(r.msgs) > 0
 			msgs = append(msgs, r.msgs...)
 			posted++
 			if live && r.o.Kind == transcript.OutputFinal {
@@ -1103,11 +1213,6 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 					Text: clipText(r.o.Text, 400)}); err != nil {
 					return err
 				}
-			}
-		}
-		if recoveryEnd != f.recoveryEnd {
-			if err := tx.SetMeta(realignKey(f.src.ID), fmt.Sprintf("end:%d", recoveryEnd)); err != nil {
-				return err
 			}
 		}
 		if posted > 0 && creating {
@@ -1139,7 +1244,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 				}
 			}
 		}
-		if localActivity || (!rewritten && info.Size > f.src.Size && info.Size > recoveryEnd) {
+		if localActivity || info.Size > f.src.Size {
 			c, ok, err := tx.Conversation(f.src.ConvID)
 			if err != nil {
 				return err
@@ -1153,6 +1258,11 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		}
 		if err := tx.AdvanceSource(f.src.ID, off, line, info.Size, ms(info.MTime), info.Inode, msgs); err != nil {
 			return err
+		}
+		if hasProof {
+			if err := tx.SetMirrorCheckpoint(f.src.ID, proof); err != nil {
+				return err
+			}
 		}
 		if v := sourceInfo(f.tracker.Info()); v != f.infoSaved && f.src.ID != 0 {
 			if err := tx.SetSourceInfo(f.src.ID, v); err != nil {
@@ -1194,7 +1304,10 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		f.historyEnd = 0 // the import offsets no longer apply after a rollout rewrite
 	}
 	f.infoSaved = saved
-	f.recoveryEnd = recoveryEnd
+	if hasProof {
+		f.proof = proof
+	}
+	f.proofHash, f.openVerified = proofHash, true
 	if !more {
 		f.info = info
 	}
@@ -1238,10 +1351,10 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 // A live record (not catch-up) of Codex closes with the goal and model
 // lines of its thread as the rollout said them then (infoNotes).
 func (e *Engine) renderMirror(ctx context.Context, conv int64, thread string, o transcript.Output, live bool) ([]store.OutMsg, error) {
-	return e.renderMirrorMode(ctx, conv, thread, o, live, false, false)
+	return e.renderMirrorMode(ctx, conv, thread, o, live, false)
 }
 
-func (e *Engine) renderMirrorMode(ctx context.Context, conv int64, thread string, o transcript.Output, live, recovery, history bool) ([]store.OutMsg, error) {
+func (e *Engine) renderMirrorMode(ctx context.Context, conv int64, thread string, o transcript.Output, live, history bool) ([]store.OutMsg, error) {
 	var files []store.OutMsg
 	if o.Kind == transcript.OutputFinal && hasArtifactFence(o.Text) {
 		if history {
@@ -1297,9 +1410,6 @@ func (e *Engine) renderMirrorMode(ctx context.Context, conv int64, thread string
 	if o.Kind == transcript.OutputStatus && o.TurnID != "" {
 		group = "mirror:" + thread + ":" + o.TurnID
 	}
-	if recovery {
-		group = store.RecoveryGroupPrefix + thread
-	}
 	out := make([]store.OutMsg, 0, len(parts))
 	for _, p := range parts {
 		alternate := ""
@@ -1308,11 +1418,6 @@ func (e *Engine) renderMirrorMode(ctx context.Context, conv int64, thread string
 		}
 		out = append(out, store.OutMsg{AlternateKey: alternate, DeliveryKey: o.Key(thread, p.Index), Kind: store.OutMirror, Part: p.Index, Parts: p.Count,
 			Body: p.Body, BodyHash: hashBytes(p.Hash), ProgressGroup: group})
-	}
-	if recovery {
-		for i := range files {
-			files[i].ProgressGroup = group
-		}
 	}
 	return append(out, files...), nil
 }

@@ -114,6 +114,9 @@ func (t *Tx) AdvanceSource(id, offset, line, size, mtime, inode int64, outputs [
 // delivered keep their delivery keys, so re-reading posts none of them
 // twice.
 func (t *Tx) RewindSource(id, conv int64, state string) error {
+	if err := t.DeleteMirrorCheckpoint(id); err != nil {
+		return err
+	}
 	res, err := t.exec(`UPDATE transcript_sources SET offset = 0, line = 0, conv_id = ?, state = ?, updated_at = ? WHERE id = ?`,
 		nullInt(conv), state, t.now, id)
 	if err != nil {

@@ -4,7 +4,7 @@ package store
 const ApplicationID = 0x63787031
 
 // SchemaVersion is the PRAGMA user_version this code writes and understands.
-const SchemaVersion = 13
+const SchemaVersion = 14
 
 // migrations[i] upgrades user_version i to i+1. Each step runs in one
 // transaction together with the user_version bump. There is no pointer file.
@@ -67,6 +67,23 @@ var migrations = [][]string{
 	// Counts can read state from the index without fetching large outbox bodies.
 	{`DROP INDEX outbox_pending`,
 		`CREATE INDEX outbox_pending ON outbox(conv_id,seq,state) WHERE state IN ('queued','sending','unknown')`},
+	{`CREATE TABLE mirror_checkpoints (
+ source_id INTEGER PRIMARY KEY REFERENCES transcript_sources(id) ON DELETE CASCADE,
+ device INTEGER NOT NULL,
+ read_end INTEGER NOT NULL,
+ window_hash BLOB NOT NULL,
+ context_hash BLOB NOT NULL,
+ anchor_end INTEGER NOT NULL,
+ anchor_line INTEGER NOT NULL,
+ anchor_hash BLOB
+ )`,
+		`ALTER TABLE turns ADD COLUMN transcript_gap INTEGER NOT NULL DEFAULT 0`,
+		`CREATE INDEX outbox_held_turn ON outbox(conv_id,hold_turn) WHERE hold_turn IS NOT NULL AND state='queued'`,
+		`ALTER TABLE outbox ADD COLUMN recovery_review INTEGER NOT NULL DEFAULT 0`,
+		// Preserve the payload, keys and evidence, including frozen batches
+		// which might already have been committed remotely.
+		`UPDATE outbox SET recovery_review=1,state=CASE WHEN state='queued' THEN 'dropped' ELSE state END
+		   WHERE state IN ('queued','sending','unknown') AND kind='mirror' AND progress_group GLOB 'recovery:*'`},
 }
 
 // schemaV1 is the complete initial schema (STORE-DESIGN.md §3). No triggers
@@ -267,5 +284,5 @@ var schemaV1 = []string{
 var Tables = []string{
 	"meta", "owner", "conversations", "threads", "streams", "turns", "inbound",
 	"inbound_files", "outbox", "outbox_files", "transcript_sources", "forks",
-	"restart_confirmation", "freeze_notices", "notifications", "pending_notifications", "cli_requests", "cli_result_lines", "codex_upgrade", "codex_upgrade_targets", "dashboard_view", "dashboard_items", "source_info", "delegated_threads", "import_jobs", "update_requests", "update_pending", "restart_requests", "model_fork_notes", "answer_checks", "history_checks", "gates", "question_groups", "questions", "question_options", "model_switches", "continuation_inputs", "turn_recovery", "goal_controls",
+	"restart_confirmation", "freeze_notices", "notifications", "pending_notifications", "cli_requests", "cli_result_lines", "codex_upgrade", "codex_upgrade_targets", "dashboard_view", "dashboard_items", "source_info", "delegated_threads", "import_jobs", "update_requests", "update_pending", "restart_requests", "model_fork_notes", "answer_checks", "history_checks", "gates", "question_groups", "questions", "question_options", "model_switches", "continuation_inputs", "turn_recovery", "goal_controls", "mirror_checkpoints",
 }

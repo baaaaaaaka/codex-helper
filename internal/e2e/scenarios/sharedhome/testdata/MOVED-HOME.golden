@@ -118,11 +118,10 @@
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>Recovered history</strong></p>
-   | <p><strong>🧑‍💻 User:</strong></p>
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>On the new machine E2E-MOVEDHOME-tuiprompt2-5</p>
-   | <hr>
-   | <p><strong>🤖 ✅ Codex answer:</strong></p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>New machine answer E2E-MOVEDHOME-tuianswer2-6</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
