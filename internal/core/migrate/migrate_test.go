@@ -579,7 +579,7 @@ func TestRolloutClassification(t *testing.T) {
 	eq(t, "unreadable first line: baseline at EOF", state("6"), "baseline@"+size(bad))
 	eq(t, "linked by file name: tracking at EOF", qs(t, db, `SELECT s.state || '@' || s.offset || '/' || c.label FROM transcript_sources s JOIN conversations c ON c.id = s.conv_id WHERE path = ?`, linked), "tracking@"+size(linked)+"/s002")
 	// Checkpoint paths that do not exist on disk become 'missing' with their offsets kept.
-	eq(t, "missing checkpoint file", qs(t, db, sourceQ, "%000000000001.jsonl"), "missing@40000:100")
+	eq(t, "missing checkpoint file", qs(t, db, sourceQ, "%11111111-1111-4111-8111-000000000001.jsonl"), "missing@40000:100")
 	eq(t, "bucket interactive", rep.Buckets["unlinked interactive -> no row (discovery)"], 2)
 	eq(t, "bucket subagent/exec", rep.Buckets["unlinked subagent/exec -> ignored"], 2)
 	eq(t, "bucket originator", rep.Buckets["unlinked originator=codex-helper -> ignored"], 1)
