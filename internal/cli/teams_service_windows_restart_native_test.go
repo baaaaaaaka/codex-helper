@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/lease"
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 )
 
 const windowsHandoffFixtureAnchor = "CXP_CI_WINDOWS_TEAMS_HANDOFF_ANCHOR"
@@ -152,7 +153,7 @@ func TestTeamsServiceWindowsNativeScheduledRestartHandoff(t *testing.T) {
 
 	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
 	defer graph.Close()
-	exe, err := os.Executable()
+	exe, err := helperpath.RawExecutable()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,6 +221,26 @@ func TestTeamsServiceWindowsNativeScheduledRestartHandoff(t *testing.T) {
 		t.Fatal("could not open the original bridge process")
 	}
 	defer release()
+	// A process with the same executable and bridge arguments, launched
+	// outside this task, must survive the restart.
+	unrelatedAnchor := filepath.Join(t.TempDir(), "core.sqlite")
+	unrelated := exec.Command(child, args...)
+	unrelated.Env = append(os.Environ(),
+		windowsHandoffFixtureAnchor+"="+unrelatedAnchor,
+		"CXP_CI_WINDOWS_TEAMS_HANDOFF_RUNTIME="+child,
+		"CXP_CI_WINDOWS_TEAMS_HANDOFF_GRAPH="+graph.URL)
+	if err := unrelated.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = unrelated.Process.Kill()
+		_ = unrelated.Wait()
+	})
+	unrelatedExited, releaseUnrelated := teamsWindowsBridgeExitProbe(lease.Record{PID: unrelated.Process.Pid, Wall: time.Now().UnixMilli()})
+	if unrelatedExited == nil || unrelatedExited() {
+		t.Fatal("could not open the unrelated fixture process")
+	}
+	defer releaseUnrelated()
 	var output bytes.Buffer
 	backend := teamsWindowsHandoffTestBackend{task: task}
 	if err := restartTeamsWindowsTask(ctx, &output, anchor, host, teamsBootID(), 12*time.Second, 5*time.Second, backend); err != nil {
@@ -231,6 +252,9 @@ func TestTeamsServiceWindowsNativeScheduledRestartHandoff(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "has polled Teams") {
 		t.Fatalf("new bridge did not poll Teams: %s", output.String())
+	}
+	if unrelatedExited() {
+		t.Fatal("restart stopped an unrelated Teams process")
 	}
 	logs, err := filepath.Glob(filepath.Join(tmp, "logs", "codex-helper", "teams", "*.stdout.log"))
 	if err != nil || len(logs) != 2 {
