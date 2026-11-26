@@ -36,39 +36,46 @@ func teamsServiceWindowsRestartPowerShell(task, watchdog string) string {
 // can remove the launcher or entry while leaving the bridge alive.
 func teamsServiceWindowsCaptureTaskBridgePowerShell(task string) string {
 	return "$bridgeRuntimeIdentity = Get-CodexHelperBridgeTaskIdentity " + task + "; " + `
+function Get-CodexHelperBridgePath([string]$path) {
+    if ($path) {
+        try { return [IO.Path]::GetFullPath($path) } catch { }
+    }
+    return ''
+}
 $bridgeRuntimeProcesses = @()
 $bridgeRuntimeEntry = [string]$bridgeRuntimeIdentity['Exe']
 $bridgeRuntimeArgs = [string]$bridgeRuntimeIdentity['ScriptArgs']
-$bridgeRuntimeScript = [string]$bridgeRuntimeIdentity['Script']
+$bridgeRuntimeScript = Get-CodexHelperBridgePath $bridgeRuntimeIdentity['Script']
 if ($bridgeRuntimeEntry -and $bridgeRuntimeArgs -and $bridgeRuntimeScript) {
     $versions = Join-Path ([IO.Path]::GetDirectoryName($bridgeRuntimeEntry)) '.cxp-runtime\versions'
-    $fileArgument = Convert-CodexHelperCommandForMatch ('-File "' + $bridgeRuntimeScript + '"')
     $byPID = @{}
     $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
     foreach ($process in $processes) { $byPID[[int]$process.ProcessId] = $process }
     foreach ($bridge in $processes) {
-        $path = [string]$bridge.ExecutablePath
-        if (-not $path -or -not (Test-CodexHelperTeamsBridgeCommand $bridge.CommandLine $bridgeRuntimeArgs)) { continue }
+        if (-not (Test-CodexHelperTeamsBridgeCommand $bridge.CommandLine $bridgeRuntimeArgs)) { continue }
+        $path = Get-CodexHelperBridgePath $bridge.ExecutablePath
+        if (-not $path) { continue }
         $entry = $bridge
         if ($path -ine $bridgeRuntimeEntry) {
             if ([IO.Path]::GetFileName($path) -ine 'cxp.exe') { continue }
             $version = [IO.Path]::GetDirectoryName($path)
             if ([IO.Path]::GetDirectoryName($version) -ine $versions) { continue }
             $entry = $byPID[[int]$bridge.ParentProcessId]
-            if ($null -eq $entry -or $entry.ExecutablePath -ine $bridgeRuntimeEntry -or $entry.CreationDate -gt $bridge.CreationDate) { continue }
+            if ($null -eq $entry -or (Get-CodexHelperBridgePath $entry.ExecutablePath) -ine $bridgeRuntimeEntry -or $entry.CreationDate -gt $bridge.CreationDate) { continue }
             if (-not (Test-CodexHelperTeamsBridgeCommand $entry.CommandLine $bridgeRuntimeArgs)) { continue }
         }
         $launcher = $byPID[[int]$entry.ParentProcessId]
         if ($null -eq $launcher -or $launcher.Name -ine 'powershell.exe' -or $launcher.CreationDate -gt $entry.CreationDate) { continue }
-        $command = Convert-CodexHelperCommandForMatch $launcher.CommandLine
-        if ($command.IndexOf($fileArgument, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        $file = [regex]::Match([string]$launcher.CommandLine, '(?i)(?:^|\s)-File\s+(?:"([^"]+)"|([^\s"]+))(?=\s|$)')
+        $launcherPath = Get-CodexHelperBridgePath ($file.Groups[1].Value + $file.Groups[2].Value)
+        if ($launcherPath -ine $bridgeRuntimeScript) { continue }
         $pinned = Get-Process -Id $bridge.ProcessId -ErrorAction SilentlyContinue
         if ($null -eq $pinned) { continue }
         try {
             # Pin the kernel handle before stopping the task. A reused PID
             # must never be mistaken for this task's bridge.
             [void]$pinned.Handle
-            if ($pinned.Path -ieq $path -and [Math]::Abs(($pinned.StartTime.ToUniversalTime() - $bridge.CreationDate.ToUniversalTime()).TotalMilliseconds) -lt 1) {
+            if ((Get-CodexHelperBridgePath $pinned.Path) -ieq $path -and [Math]::Abs(($pinned.StartTime.ToUniversalTime() - $bridge.CreationDate.ToUniversalTime()).TotalMilliseconds) -lt 1) {
                 $bridgeRuntimeProcesses += $pinned
                 $pinned = $null
             }
