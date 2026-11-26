@@ -21,10 +21,11 @@ const teamsPollStampName = "core-poll.sqlite"
 const teamsPollStampEvery = 10 * time.Second
 
 type teamsPollStamp struct {
-	Host    string `json:"host"`
-	PID     int    `json:"pid"`
-	Version string `json:"version,omitempty"`
-	At      int64  `json:"at"` // unix ms of the last successful read
+	Host, Version string
+	PID           int
+	At            int64 // unix ms of the last successful read
+	Generation    int64
+	FailureSince  int64 // unix ms, only when this owner detects a sustained failure
 }
 
 func teamsPollStampPath(dir string) string { return filepath.Join(dir, teamsPollStampName) }
@@ -35,44 +36,66 @@ func writeTeamsPollStamp(dir string, s teamsPollStamp) error {
 
 func readTeamsPollStamp(dir string) (teamsPollStamp, bool) {
 	s, err := readTeamsPollSnapshot(teamsPollStampPath(dir))
-	return s, err == nil && s.At != 0
+	return s, err == nil && (s.At != 0 || s.FailureSince != 0)
 }
 
-// teamsPollStamper rewrites the file when the engine has read Teams since
-// the last write, at most every teamsPollStampEvery. It runs on the
-// helper's existing 5 s watcher tick: no timer of its own.
+// teamsPollStamper writes when a poll or degradation state changes, at
+// most every teamsPollStampEvery. It uses the existing 5 s watcher tick.
 type teamsPollStamper struct {
 	dir, host, version string
+	gen                int64
 	lastRead           func() time.Time
-	written, wroteAt   time.Time
+	failedSince        func(time.Time) time.Time
+	written            teamsPollStamp
+	wroteAt            time.Time
 }
 
 func (p *teamsPollStamper) tick(now time.Time) {
 	at := p.lastRead()
-	if at.IsZero() || !at.After(p.written) || (!p.wroteAt.IsZero() && now.Sub(p.wroteAt) < teamsPollStampEvery) {
+	stamp := teamsPollStamp{Host: p.host, PID: os.Getpid(), Version: p.version, Generation: p.gen}
+	if !at.IsZero() {
+		stamp.At = at.UnixMilli()
+	}
+	if p.failedSince != nil {
+		if since := p.failedSince(at); !since.IsZero() {
+			stamp.FailureSince = since.UnixMilli()
+		}
+	}
+	if (stamp.At == 0 && stamp.FailureSince == 0 && p.written.FailureSince == 0) ||
+		stamp == p.written || (!p.wroteAt.IsZero() && now.Sub(p.wroteAt) < teamsPollStampEvery) {
 		return
 	}
-	if err := writeTeamsPollStamp(p.dir, teamsPollStamp{Host: p.host, PID: os.Getpid(), Version: p.version, At: at.UnixMilli()}); err == nil {
-		p.written, p.wroteAt = at, now
+	if err := writeTeamsPollStamp(p.dir, stamp); err == nil {
+		p.written, p.wroteAt = stamp, now
 	}
+}
+
+func teamsPollFromOwner(view teamsStoreView, s teamsPollStamp, now time.Time) bool {
+	in := view.Info
+	return in.Live(now, lease.ProductionStale) && teamsHostEqual(in.Head.Host, s.Host) && in.Head.PID == s.PID &&
+		(s.Generation == 0 || s.Generation == in.HeadGen)
 }
 
 // teamsLastPollLine is the status line for the last successful read of
 // Teams ("" when no helper ever recorded one).
 func teamsLastPollLine(view teamsStoreView, now time.Time) string {
 	s, ok := readTeamsPollStamp(filepath.Dir(view.Anchor))
+	line := "Last poll: none recorded"
 	if !ok {
-		return "Last poll: none recorded"
+		return line
 	}
-	at := time.UnixMilli(s.At)
-	age := now.Sub(at).Round(time.Second)
-	if age < 0 {
-		age = 0
+	current := teamsPollFromOwner(view, s, now)
+	if s.At != 0 {
+		at := time.UnixMilli(s.At)
+		age := max(0, now.Sub(at).Round(time.Second))
+		line = fmt.Sprintf("Last poll: %s (%s ago)", at.Local().Format(time.RFC3339), age)
+		if !current {
+			line += fmt.Sprintf(" by the helper on %s (pid %d), which is not running now", s.Host, s.PID)
+		}
 	}
-	line := fmt.Sprintf("Last poll: %s (%s ago)", at.Local().Format(time.RFC3339), age)
-	in := view.Info
-	if !in.HeadOK || in.Head.State == lease.Released || !in.Live(now, lease.ProductionStale) || in.Head.Host != s.Host || in.Head.PID != s.PID {
-		line += fmt.Sprintf(" by the helper on %s (pid %d), which is not running now", s.Host, s.PID)
+	if current && s.FailureSince != 0 {
+		age := max(0, now.Sub(time.UnixMilli(s.FailureSince)).Round(time.Second))
+		line += fmt.Sprintf("\nTeams Graph: degraded (proxy or gateway failures for %s)", age)
 	}
 	return line
 }

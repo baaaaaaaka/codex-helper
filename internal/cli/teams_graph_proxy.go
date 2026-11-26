@@ -20,6 +20,7 @@ type teamsGraphHTTPClientLease struct {
 	Client                 *http.Client
 	ProxyURL               string
 	Mode                   string
+	profile                config.Profile
 	close                  func(context.Context) error
 	store                  *config.Store
 	suspectReusableProxies []config.Instance
@@ -104,22 +105,20 @@ func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io
 	hc := healthClientForProxyTarget(3*time.Second, "graph.microsoft.com", 443)
 	var suspects []config.Instance
 	if lease, suspect, ok, err := reusableTeamsGraphProxyLease(ctx, cfg, profile.ID, hc); ok || err != nil {
+		lease.profile = profile
 		return lease, err
 	} else {
 		suspects = appendTeamsGraphProxySuspect(suspects, suspect)
 	}
 	if fresh, err := store.Load(); err == nil {
 		if lease, suspect, ok, err := reusableTeamsGraphProxyLease(ctx, fresh, profile.ID, hc); ok || err != nil {
+			lease.profile = profile
 			return lease, err
 		} else {
 			suspects = appendTeamsGraphProxySuspect(suspects, suspect)
 		}
 	}
-	instanceID, err := ids.New()
-	if err != nil {
-		return teamsGraphHTTPClientLease{}, err
-	}
-	st, err := teamsGraphStackStart(ctx, profile, instanceID, stack.Options{})
+	private, err := startTeamsPrivateGraphProxy(ctx, profile)
 	if err != nil {
 		if ctx.Err() != nil {
 			return teamsGraphHTTPClientLease{}, ctx.Err()
@@ -129,6 +128,7 @@ func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io
 		// surfacing the fallback start error.
 		if fresh, loadErr := store.Load(); loadErr == nil {
 			if lease, suspect, ok, leaseErr := reusableTeamsGraphProxyLease(ctx, fresh, profile.ID, hc); ok || leaseErr != nil {
+				lease.profile = profile
 				return lease, leaseErr
 			} else {
 				suspects = appendTeamsGraphProxySuspect(suspects, suspect)
@@ -136,17 +136,32 @@ func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io
 		}
 		return teamsGraphHTTPClientLease{}, fmt.Errorf("start Teams Graph proxy stack: could not establish the configured SSH proxy connection: %w", err)
 	}
+	if out != nil {
+		_, _ = fmt.Fprintf(out, "Teams Graph proxy: using %s\n", private.ProxyURL)
+	}
+	retained = true
+	private.store, private.suspectReusableProxies = store, suspects
+	return private, nil
+}
+
+// Start a route owned by the calling Teams bridge. Recovery uses this
+// directly: a shared proxy can pass Graph CONNECT while OAuth still fails.
+func startTeamsPrivateGraphProxy(ctx context.Context, profile config.Profile) (teamsGraphHTTPClientLease, error) {
+	instanceID, err := ids.New()
+	if err != nil {
+		return teamsGraphHTTPClientLease{}, err
+	}
+	st, err := teamsGraphStackStart(ctx, profile, instanceID, stack.Options{})
+	if err != nil {
+		return teamsGraphHTTPClientLease{}, err
+	}
 	proxyURL := st.HTTPProxyURL()
 	client, err := newTeamsProxyHTTPClient(proxyURL)
 	if err != nil {
 		_ = st.Close(context.Background())
 		return teamsGraphHTTPClientLease{}, err
 	}
-	if out != nil {
-		_, _ = fmt.Fprintf(out, "Teams Graph proxy: using %s\n", proxyURL)
-	}
-	retained = true
-	return teamsGraphHTTPClientLease{Client: client, ProxyURL: proxyURL, Mode: "proxy-stack", close: st.Close, store: store, suspectReusableProxies: suspects}, nil
+	return teamsGraphHTTPClientLease{Client: client, ProxyURL: proxyURL, Mode: "proxy-stack", profile: profile, close: st.Close}, nil
 }
 
 type teamsGraphProxyLocalStatus struct {
@@ -389,10 +404,14 @@ func newTeamsProxyHTTPClient(proxyURL string) (*http.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: newTeamsHTTPTransport(http.ProxyURL(parsed)),
-	}, nil
+	transport := newTeamsHTTPTransport(http.ProxyURL(parsed))
+	transport.OnProxyConnectResponse = func(_ context.Context, _ *url.URL, _ *http.Request, res *http.Response) error {
+		if teamsGraphGatewayFailure(res.StatusCode) {
+			return teamsGraphConnectError{status: res.StatusCode}
+		}
+		return nil
+	}
+	return &http.Client{Timeout: 30 * time.Second, Transport: transport}, nil
 }
 
 func newTeamsHTTPTransport(proxy func(*http.Request) (*url.URL, error)) *http.Transport {
