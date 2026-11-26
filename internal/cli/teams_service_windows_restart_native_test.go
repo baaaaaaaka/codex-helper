@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -241,6 +242,27 @@ func TestTeamsServiceWindowsNativeScheduledRestartHandoff(t *testing.T) {
 		t.Fatal("could not open the unrelated fixture process")
 	}
 	defer releaseUnrelated()
+	// Check the capture independently so that failures include the process
+	// identities before Task Scheduler has removed their parents.
+	capture := teamsServiceWindowsBridgeIdentityPowerShell() + teamsServiceWindowsCaptureTaskBridgePowerShell(task)
+	diagnostic := `$bridgeRuntimeIdentity | Format-List | Out-String -Width 240; Write-Output ('Task action: ' + (Get-ScheduledTask -TaskName ` + task + `).Actions.Arguments)
+$known = ` + strconv.Itoa(old.Head.PID) + `
+for ($i = 0; $i -lt 5 -and $known; $i++) {
+    $fixtureProcess = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $known)
+    if ($null -eq $fixtureProcess) { break }
+    $fixtureProcess | Format-List Name,ProcessId,ParentProcessId,ExecutablePath,CommandLine,CreationDate | Out-String -Width 240
+    $known = $fixtureProcess.ParentProcessId
+}`
+	captured, err := teamsServiceRunPowerShell(ctx, capture+"$bridgeRuntimeProcesses | ForEach-Object { Write-Output $_.Id }; ")
+	if err != nil || !strings.Contains("
+"+strings.ReplaceAll(string(captured), "
+", "
+"), "
+"+strconv.Itoa(old.Head.PID)+"
+") {
+		detail, _ := teamsServiceRunPowerShell(ctx, capture+diagnostic)
+		t.Fatalf("Windows Task Scheduler fixture failed to capture pid %d: %v\nCaptured: %s\n%s", old.Head.PID, err, captured, detail)
+	}
 	var output bytes.Buffer
 	backend := teamsWindowsHandoffTestBackend{task: task}
 	if err := restartTeamsWindowsTask(ctx, &output, anchor, host, teamsBootID(), 12*time.Second, 5*time.Second, backend); err != nil {
