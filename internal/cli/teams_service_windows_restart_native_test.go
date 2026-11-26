@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -254,12 +255,7 @@ for ($i = 0; $i -lt 5 -and $known; $i++) {
     $known = $fixtureProcess.ParentProcessId
 }`
 	captured, err := teamsServiceRunPowerShell(ctx, capture+"$bridgeRuntimeProcesses | ForEach-Object { Write-Output $_.Id }; ")
-	if err != nil || !strings.Contains("
-"+strings.ReplaceAll(string(captured), "
-", "
-"), "
-"+strconv.Itoa(old.Head.PID)+"
-") {
+	if err != nil || !slices.Contains(strings.Fields(string(captured)), strconv.Itoa(old.Head.PID)) {
 		detail, _ := teamsServiceRunPowerShell(ctx, capture+diagnostic)
 		t.Fatalf("Windows Task Scheduler fixture failed to capture pid %d: %v\nCaptured: %s\n%s", old.Head.PID, err, captured, detail)
 	}
