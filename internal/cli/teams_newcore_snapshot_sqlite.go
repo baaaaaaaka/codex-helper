@@ -44,13 +44,14 @@ func readTeamsStatusSnapshot(path string) (p teamsPublishedStatus, err error) {
 
 func writeTeamsPollSnapshot(path string, s teamsPollStamp) error {
 	return sqlitestate.PublishSnapshot(path, nil, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`CREATE TABLE poll(id INTEGER PRIMARY KEY CHECK(id=1),host TEXT NOT NULL,pid INTEGER NOT NULL,version TEXT NOT NULL,at INTEGER NOT NULL)`); err != nil {
+		if _, err := tx.Exec(`CREATE TABLE poll(id INTEGER PRIMARY KEY CHECK(id=1),host TEXT NOT NULL,pid INTEGER NOT NULL,version TEXT NOT NULL,at INTEGER NOT NULL,generation INTEGER NOT NULL,failure_since INTEGER NOT NULL)`); err != nil {
 			return err
 		}
-		_, err := tx.Exec(`INSERT INTO poll VALUES(1,?,?,?,?)`, s.Host, s.PID, s.Version, s.At)
+		_, err := tx.Exec(`INSERT INTO poll VALUES(1,?,?,?,?,?,?)`, s.Host, s.PID, s.Version, s.At, s.Generation, s.FailureSince)
 		return err
 	})
 }
+
 func readTeamsPollSnapshot(path string) (s teamsPollStamp, err error) {
 	db, err := sqlitestate.OpenSnapshot(path, 64*1024)
 	if err != nil {
@@ -64,6 +65,28 @@ func readTeamsPollSnapshot(path string) (s teamsPollStamp, err error) {
 	if v != 1 {
 		return s, fmt.Errorf("unsupported poll schema %d", v)
 	}
-	err = db.QueryRow(`SELECT host,pid,version,at FROM poll WHERE id=1`).Scan(&s.Host, &s.PID, &s.Version, &s.At)
+	// Older readers select the original four columns by name. Accept
+	// snapshots from those versions as well, without attempting a migration.
+	rows, err := db.Query(`SELECT * FROM poll WHERE id=1`)
+	if err != nil {
+		return s, err
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return s, err
+	}
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return s, err
+		}
+		return s, sql.ErrNoRows
+	}
+	var id int
+	fields := []any{&id, &s.Host, &s.PID, &s.Version, &s.At}
+	if len(columns) == 7 {
+		fields = append(fields, &s.Generation, &s.FailureSince)
+	}
+	err = rows.Scan(fields...)
 	return s, err
 }

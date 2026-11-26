@@ -341,8 +341,14 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 	if err != nil {
 		return err
 	}
-	defer func() { _ = graphLease.Close(context.Background()) }()
-	client := teamsFencedHTTPClient(graphLease.Client, st.Fence)
+	var graphRecovery *teamsGraphRecovery
+	defer func() {
+		if graphRecovery == nil {
+			_ = graphLease.Close(context.Background())
+		} else {
+			graphRecovery.close()
+		}
+	}()
 	authCfg, err := chteams.ResolveAuthConfig("")
 	if err != nil {
 		return fmt.Errorf("Teams auth: %w", err)
@@ -351,7 +357,30 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 	if err != nil {
 		return fmt.Errorf("Teams read auth: %w", err)
 	}
-	ch, err := chteams.New(teamsNewCoreChannelConfig(client, authCfg, readCfg))
+	client := teamsFencedHTTPClient(graphLease.Client, st.Fence)
+	channelCfg := teamsNewCoreChannelConfig(client, authCfg, readCfg)
+	if graphLease.ProxyURL != "" && !opts.once {
+		separateReadAuth := channelCfg.ReadTokens != nil
+		probe := func(ctx context.Context, candidate *http.Client, kind teamsGraphRequestKind) error {
+			auth := authCfg
+			if kind != teamsGraphFullAuth && separateReadAuth {
+				auth = readCfg
+			}
+			return teamsGraphRecoveryProbe(ctx, teamsFencedHTTPClient(candidate, st.Fence), auth)
+		}
+		graphRecovery = newTeamsGraphRecovery(runCtx, graphLease, func(ctx context.Context) (teamsGraphHTTPClientLease, error) {
+			return startTeamsPrivateGraphProxy(ctx, graphLease.profile)
+		}, probe, time.Now, teamsGraphFailureWindow, errOut)
+
+		timeout := graphLease.Client.Timeout
+		client = teamsFencedHTTPClient(graphRecovery.client(teamsGraphRead, timeout), st.Fence)
+		channelCfg.HTTP = client
+		channelCfg.Tokens = chteams.NewDelegatedAuth(authCfg, teamsFencedHTTPClient(graphRecovery.client(teamsGraphFullAuth, timeout), st.Fence))
+		if separateReadAuth {
+			channelCfg.ReadTokens = chteams.NewDelegatedAuth(readCfg, teamsFencedHTTPClient(graphRecovery.client(teamsGraphReadAuth, timeout), st.Fence))
+		}
+	}
+	ch, err := chteams.New(channelCfg)
 	if err != nil {
 		return err
 	}
@@ -474,7 +503,10 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 	published := make(chan struct{})
 	go func() { defer close(published); publisher.run(runCtx) }()
 	defer func() { cancelRun(); <-published }() // before the store closes
-	stamper := &teamsPollStamper{dir: dir, host: host, version: cfg.Version, lastRead: func() time.Time { return e.Snapshot().LastRead }}
+	stamper := &teamsPollStamper{dir: dir, host: host, version: cfg.Version, gen: holder.Gen(), lastRead: func() time.Time { return e.Snapshot().LastRead }}
+	if graphRecovery != nil {
+		stamper.failedSince = graphRecovery.degradedSince
+	}
 	tuiServer, err := tuilease.Listen(teamsTUIEndpointPath(anchor, host), paths.CodexDir, e, func(path string) error { return ensurePathOwnedByIdentity(path, paths.ExecIdentity) })
 	if err != nil {
 		return err
