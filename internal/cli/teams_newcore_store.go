@@ -52,9 +52,12 @@ func resolveTeamsCoreStorePath(stateDir string) (string, error) {
 // first start's lease. Selection does not decide whether migration is done:
 // prepareTeamsCoreStore makes that decision after acquiring the lease.
 func planTeamsCoreStore(stateDir string) (path string, err error) {
-	if p := strings.TrimSpace(os.Getenv(envTeamsCoreStore)); p != "" {
-		p, err := filepath.Abs(p)
-		return p, err
+	return planTeamsCoreStoreWithOverride(stateDir, os.Getenv(envTeamsCoreStore))
+}
+
+func planTeamsCoreStoreWithOverride(stateDir, override string) (string, error) {
+	if path := strings.TrimSpace(override); path != "" {
+		return filepath.Abs(path)
 	}
 	exists := func(p string) bool { _, err := os.Stat(p); return err == nil }
 	var found []string

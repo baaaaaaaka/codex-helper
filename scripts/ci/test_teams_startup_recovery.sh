@@ -44,6 +44,10 @@ run_tests() {
 case "$mode" in
   unit)
     run_tests ./internal/cli '^TestTeamsGraphRecovery' 'TestTeamsGraphRecoveryResumesPollAndDurableOutbox,TestTeamsGraphRecoveryRefreshesBeforeSwitchAndDrainsInFlight,TestTeamsGraphRecoveryFailureAndThrottle,TestTeamsGraphRecoveryPollSnapshotCompatibility,TestTeamsGraphRecoveryDetectsProxyConnect502' 1
+    run_tests ./internal/cli '^TestTeamsServiceWindowsRestart(HandoffContract|UsesInstalledState)$' 'TestTeamsServiceWindowsRestartHandoffContract,TestTeamsServiceWindowsRestartUsesInstalledState' 1
+    if [[ "${OS:-}" == Windows_NT ]]; then
+      run_tests ./internal/cli '^TestTeamsServiceWindowsNative(ScheduledRestartHandoff|PinsOldProcess)$' 'TestTeamsServiceWindowsNativeScheduledRestartHandoff,TestTeamsServiceWindowsNativePinsOldProcess' 1
+    fi
     run_tests ./internal/core/store '^TestRecovery' 'TestRecoveryEvidenceBoundedAtomicAndDurable,TestRecoveryPointReadsDoNotWrite,TestRecoveryBudgetAndCancelSurviveProbeAndReopen' 1
     run_tests ./internal/core/engine '^TestRecovery' 'TestRecoveryCancelDuringLookupIsRetained,TestRecoveryCodexOwnsRetryUntilTerminal,TestRecoveryRestartRetainsRejectedBackoff,TestRecoveryRestartSettlesByEvidence,TestRecoveryUnconfirmedNeverRetries,TestRecoveryStoppedExecutorContinuesWithWarning,TestRecoveryCommittedCancelSurvivesBeforeInterrupt,TestRecoveryInterruptionBudgetStopsRepeatedCrashes,TestRecoveryQueuedContinuationHonorsCancelAndThreadChange' 1
     run_tests ./internal/core/codexagent '^TestRecovery' 'TestRecoveryMissingRegistryDoesNotProveExecutorStopped,TestRecoveryAttachedOrRunningExecutorBlocksContinuation,TestRecoveryUnknownStatusDoesNotBecomeRetryableFailure' 1

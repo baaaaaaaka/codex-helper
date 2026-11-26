@@ -12,7 +12,10 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
+var teamsWindowsHandoffTestChild = func() {}
+
 func TestMain(m *testing.M) {
+	teamsWindowsHandoffTestChild()
 	if os.Getenv("CXP_TEAMS_TAKEOVER_SUPERVISOR_CHILD_HELPER") == "1" {
 		readyPath := os.Getenv("CXP_TEAMS_TAKEOVER_SUPERVISOR_CHILD_READY")
 		if readyPath == "" {

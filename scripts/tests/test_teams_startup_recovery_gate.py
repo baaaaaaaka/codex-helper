@@ -104,7 +104,13 @@ sys.exit(int(os.environ['FAIL_TEST']))
         p, calls = self.run_gate("unit")
         self.assertEqual(p.returncode, 0, p.stderr)
         executed = [c for c in calls if "-run" in c]
-        self.assertEqual([c[1] for c in executed], [entry[0] for entry in CONTRACTS["unit"]])
+        expected = [
+            package
+            for package, pattern, _, _ in CONTRACTS["unit"]
+            if os.environ.get("OS") == "Windows_NT"
+            or not pattern.startswith("^TestTeamsServiceWindowsNative")
+        ]
+        self.assertEqual([c[1] for c in executed], expected)
         self.assertTrue({"./internal/helperruntime", "./internal/core/store", "./internal/core/migrate", "./internal/updatestate", "./internal/config", "./internal/cli"}.issubset(c[1] for c in executed))
         self.assertTrue(all("-count=1" in c for c in executed))
 
