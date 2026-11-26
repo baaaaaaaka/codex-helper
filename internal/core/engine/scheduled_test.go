@@ -299,20 +299,62 @@ func TestScheduledWaitResultAndNotificationKeepOrdinaryTurnsUnchanged(t *testing
 }
 
 func TestScheduledNativeWaitExpiryRestoresAttention(t *testing.T) {
-	r := newRig(t, func(c *Config) {
+	// A slow agent can emit a normal hint before it reports the wait.
+	// Record committed hints after the wait starts, including queued ones.
+	type hintCount struct {
+		count int
+		err   error
+	}
+	var r *rig
+	countHints := func() hintCount {
+		var count int
+		err := r.st.View(func(q store.Querier) error {
+			return q.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM outbox WHERE delivery_key LIKE 'turn:%:silence:%'`).Scan(&count)
+		})
+		return hintCount{count, err}
+	}
+	waitStarted := make(chan hintCount, 1)
+	allowWait := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-allowWait:
+		default:
+			close(allowWait)
+		}
+	})
+	r = newRig(t, func(c *Config) {
 		c.Timing.SilenceHint = 100 * time.Millisecond
 		c.Timing.SilenceRepeat = 100 * time.Millisecond
 		a := c.Agent.(*fakeAgent)
 		a.block["expire wait"] = make(chan struct{})
-		a.during = func(_ TurnRequest, h TurnHooks) { h.Waiting("sleep-expire", 100*time.Millisecond, true) }
+		a.during = func(_ TurnRequest, h TurnHooks) {
+			<-allowWait
+			h.Waiting("sleep-expire", 100*time.Millisecond, true)
+			waitStarted <- countHints()
+		}
 	})
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "expire wait")
+	r.wait("ordinary hint before wait", func() bool { return len(r.own(work, "Still working")) >= 1 })
+	close(allowWait)
+	var before hintCount
+	select {
+	case before = <-waitStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("agent did not report the wait")
+	}
+	if before.err != nil {
+		t.Fatal(before.err)
+	}
 	r.wait("expired wait hint", func() bool { return len(r.own(work, "This run has not reported a result")) == 1 })
 	if len(r.own(work, "🕒 Wait ended")) != 0 {
 		t.Fatal("deadline expiry fabricated a native completion")
 	}
-	if len(r.own(work, "Still working"))+len(r.own(work, "may be stuck")) != 0 {
+	after := countHints()
+	if after.err != nil {
+		t.Fatal(after.err)
+	}
+	if after.count != before.count {
 		t.Fatal("expired native wait used ordinary repeated hints")
 	}
 	r.ch.PostUser(work, "helper cancel running")
