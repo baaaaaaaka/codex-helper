@@ -392,11 +392,14 @@ func newTeamsServiceRestartCmd(root *rootOptions) *cobra.Command {
 			} else if scheduled {
 				return nil
 			}
-			if err := startTeamsServiceWithOutput(cmd.Context(), true, cmd.OutOrStdout()); err != nil {
-				return err
-			}
 			backend, err := teamsServiceBackendForCurrentPlatform()
 			if err != nil {
+				return err
+			}
+			if windowsBackend, ok := backend.(teamsServiceWindowsTaskBackend); ok {
+				return restartTeamsWindowsService(cmd.Context(), cmd.OutOrStdout(), windowsBackend)
+			}
+			if err := startTeamsServiceWithOutput(cmd.Context(), true, cmd.OutOrStdout()); err != nil {
 				return err
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Restarted Teams service: %s\n", backend.Name())
@@ -1965,9 +1968,7 @@ func (teamsServiceWindowsTaskBackend) Run(ctx context.Context, action string) ([
 		cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
 		return teamsServiceRunPowerShell(ctx, teamsServiceWindowsStopTasksPowerShell()+cleanupBridgeChildren)
 	case "restart":
-		resolveWatchdog := teamsServiceWindowsResolveWatchdogTaskPowerShell()
-		cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
-		return teamsServiceRunPowerShell(ctx, teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell()+teamsServiceWaitScheduledTaskStoppedFunctionPowerShell()+"Stop-ScheduledTask -TaskName "+task+" -ErrorAction Stop; "+cleanupBridgeChildren+"Enable-ScheduledTask -TaskName "+task+" -ErrorAction Stop | Out-Null; if (-not (Wait-CodexHelperScheduledTaskStopped "+task+" 20)) { throw 'Teams bridge Scheduled Task did not stop before restart' }; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" -ErrorAction Stop | Out-Null }; Start-CodexHelperScheduledTaskIfStopped "+task+"; if ($null -ne $watchdogTask) { Start-CodexHelperScheduledTaskIfStopped "+watchdogTask+" }")
+		return teamsServiceRunPowerShell(ctx, teamsServiceWindowsRestartPowerShell(task, watchdogTask))
 	default:
 		return nil, fmt.Errorf("unsupported Teams service action for Task Scheduler: %s", action)
 	}
@@ -1988,7 +1989,7 @@ func (teamsServiceWindowsTaskBackend) RunPrimary(ctx context.Context, action str
 	case "stop":
 		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction Stop; "+cleanupBridgeChildren)
 	case "restart":
-		return teamsServiceRunPowerShell(ctx, teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell()+teamsServiceWaitScheduledTaskStoppedFunctionPowerShell()+"Stop-ScheduledTask -TaskName "+task+" -ErrorAction Stop; "+cleanupBridgeChildren+"Enable-ScheduledTask -TaskName "+task+" -ErrorAction Stop | Out-Null; if (-not (Wait-CodexHelperScheduledTaskStopped "+task+" 20)) { throw 'Teams bridge Scheduled Task did not stop before restart' }; Start-CodexHelperScheduledTaskIfStopped "+task)
+		return teamsServiceRunPowerShell(ctx, teamsServiceWindowsRestartPowerShell(task, ""))
 	default:
 		return nil, fmt.Errorf("unsupported primary Teams service action for Task Scheduler: %s", action)
 	}
@@ -2003,8 +2004,11 @@ func teamsServiceWindowsStopTasksPowerShell() string {
 }
 
 func teamsServiceWindowsResolveWatchdogTaskPowerShell() string {
-	watchdogTask := powershellSingleQuote(teamsServiceWindowsWatchdogTaskName)
-	return "$watchdogTask = Get-ScheduledTask -TaskName " + watchdogTask + " -ErrorAction SilentlyContinue; "
+	return teamsServiceWindowsResolveOptionalTaskPowerShell(powershellSingleQuote(teamsServiceWindowsWatchdogTaskName))
+}
+
+func teamsServiceWindowsResolveOptionalTaskPowerShell(task string) string {
+	return "$watchdogTask = Get-ScheduledTask -TaskName " + task + " -ErrorAction SilentlyContinue; "
 }
 
 func teamsServiceWindowsEnableTasksPowerShell() string {
@@ -4368,15 +4372,17 @@ func buildTeamsServiceWindowsPowerShell(spec teamsServiceSpec, args []string) st
 	runLogName := teamsServiceWindowsTaskRunLogName(args)
 	argumentLine := windowsCommandLine(args)
 	parts = append(parts,
-		"$logBase = [Environment]::GetFolderPath('LocalApplicationData')",
+		"$logBase = $env:LOCALAPPDATA",
+		"if ([string]::IsNullOrWhiteSpace($logBase)) { $logBase = [Environment]::GetFolderPath('LocalApplicationData') }",
 		"if ([string]::IsNullOrWhiteSpace($logBase)) { $logBase = [IO.Path]::GetTempPath() }",
 		"$logDir = Join-Path $logBase 'codex-helper\\teams'",
 		"New-Item -ItemType Directory -Force -Path $logDir | Out-Null",
 		"$runLog = Join-Path $logDir "+powershellSingleQuote(runLogName),
-		"$stdoutLog = $runLog + '.stdout.log'",
-		"$stderrLog = $runLog + '.stderr.log'",
+		"$attempt = (Get-Date).ToUniversalTime().ToString('yyyyMMddHHmmssfffffff') + '.' + $PID",
+		"$stdoutLog = $runLog + '.' + $attempt + '.stdout.log'",
+		"$stderrLog = $runLog + '.' + $attempt + '.stderr.log'",
+		"foreach ($stream in @('stdout','stderr')) { Get-ChildItem -LiteralPath $logDir -File -Filter ("+powershellSingleQuote(runLogName)+" + '.*.' + $stream + '.log') -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -Skip 2 | Remove-Item -Force -ErrorAction SilentlyContinue }",
 		"Add-Content -LiteralPath $runLog -Value ((Get-Date).ToString('o') + ' starting hidden Teams helper process; stdout ' + $stdoutLog + ' stderr ' + $stderrLog)",
-		"Remove-Item -LiteralPath $stdoutLog,$stderrLog -Force -ErrorAction SilentlyContinue",
 		"$argumentLine = "+powershellSingleQuote(argumentLine),
 	)
 	directCall := "& " + powershellSingleQuote(spec.Executable)
@@ -4384,7 +4390,7 @@ func buildTeamsServiceWindowsPowerShell(spec teamsServiceSpec, args []string) st
 		directCall += " " + powershellSingleQuote(arg)
 	}
 	parts = append(parts,
-		"if ($env:OS -eq 'Windows_NT') { $p = Start-Process -FilePath "+powershellSingleQuote(spec.Executable)+" -ArgumentList $argumentLine -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog; if ($null -ne $p) { $code = $p.ExitCode } else { $code = 1 } } else { "+directCall+" > $stdoutLog 2> $stderrLog; $code = $LASTEXITCODE }",
+		"if ($env:OS -eq 'Windows_NT') { try { $p = Start-Process -FilePath "+powershellSingleQuote(spec.Executable)+" -ArgumentList $argumentLine -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog -ErrorAction Stop; $code = $p.ExitCode } catch { Add-Content -LiteralPath $runLog -Value ((Get-Date).ToString('o') + ' Start-Process failed: ' + $_.Exception.Message); $code = 1 } } else { "+directCall+" > $stdoutLog 2> $stderrLog; $code = $LASTEXITCODE }",
 	)
 	parts = append(parts, "if ($null -eq $code) { $code = 1 }")
 	parts = append(parts, "Add-Content -LiteralPath $runLog -Value ((Get-Date).ToString('o') + ' exited ' + $code)")
