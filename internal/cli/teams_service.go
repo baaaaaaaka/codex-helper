@@ -2078,8 +2078,31 @@ func teamsServiceWindowsBridgeIdentityPowerShell() string {
 		`function Convert-CodexHelperCommandForMatch([string]$value) { if ([string]::IsNullOrWhiteSpace($value)) { return '' }; $norm = $value.Replace([char]34, ' ').Replace([char]39, ' '); $norm = [regex]::Replace($norm, '\s+', ' ').Trim(); return ' ' + $norm + ' ' };`,
 		`function Test-CodexHelperTeamsBridgeCommand([string]$cmd, [string]$expectedArgs) { if ([string]::IsNullOrWhiteSpace($cmd) -or [string]::IsNullOrWhiteSpace($expectedArgs)) { return $false }; $norm = Convert-CodexHelperCommandForMatch $cmd; $expected = Convert-CodexHelperCommandForMatch $expectedArgs; return ($norm -match '(?i)\steams\s+(run|listen|service\s+watchdog)\s' -and $norm -notmatch '(?i)\s--once\s' -and $norm.IndexOf($expected, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) };`,
 		`function Set-CodexHelperCleanupExeCandidate($identity, [string]$candidate) { if ([string]::IsNullOrWhiteSpace($candidate) -or -not [string]::IsNullOrWhiteSpace([string]$identity['Exe'])) { return }; try { $full = [IO.Path]::GetFullPath($candidate); $leaf = [IO.Path]::GetFileName($full); if (($leaf -ieq 'codex-proxy.exe' -or $leaf -ieq 'cxp.exe') -and (Test-Path -LiteralPath $full)) { $identity['Exe'] = $full } } catch { } };`,
-		`function Add-CodexHelperCleanupIdentity($identity, [string]$text) { if ([string]::IsNullOrWhiteSpace($text)) { return }; foreach ($pattern in @("Start-Process\s+-FilePath\s+'((?:''|[^'])*)'", "&\s+'((?:''|[^'])*)'")) { foreach ($m in [regex]::Matches($text, $pattern, 'IgnoreCase')) { Set-CodexHelperCleanupExeCandidate $identity (Convert-CodexHelperSingleQuotedPowerShellLiteral $m.Groups[1].Value) } }; foreach ($m in [regex]::Matches($text, ([string][char]36 + "argumentLine\s*=\s+'((?:''|[^'])*)'"), 'IgnoreCase')) { $identity['Args'] = Convert-CodexHelperSingleQuotedPowerShellLiteral $m.Groups[1].Value; break } };`,
-		`function Get-CodexHelperBridgeTaskIdentity([string]$taskName) { $identity = @{ Exe = ''; Args = ''; Script = '' }; try { $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; if ($null -eq $task) { return $identity }; foreach ($action in @($task.Actions)) { Set-CodexHelperCleanupExeCandidate $identity ([string]$action.Execute); $arguments = [string]$action.Arguments; if ($arguments -match '^teams\s+(run|listen|service\s+watchdog)\s') { $identity['Args'] = $arguments }; Add-CodexHelperCleanupIdentity $identity $arguments; foreach ($m in [regex]::Matches($arguments, '(?i)(?:^|\s)(?:"([^"]+\.vbs)"|([^\s"]+\.vbs))(?=\s|$)')) { $vbs = $m.Groups[1].Value + $m.Groups[2].Value; try { $ps1 = [IO.Path]::ChangeExtension($vbs, '.ps1'); if (Test-Path -LiteralPath $ps1) { $identity['Script'] = $ps1; Add-CodexHelperCleanupIdentity $identity (Get-Content -LiteralPath $ps1 -Raw -ErrorAction SilentlyContinue) } } catch { } } } } catch { }; return $identity };`,
+		`function Add-CodexHelperCleanupIdentity($identity, [string]$text) { if ([string]::IsNullOrWhiteSpace($text)) { return }; foreach ($pattern in @("Start-Process\s+-FilePath\s+'((?:''|[^'])*)'", "&\s+'((?:''|[^'])*)'")) { foreach ($m in [regex]::Matches($text, $pattern, 'IgnoreCase')) { Set-CodexHelperCleanupExeCandidate $identity (Convert-CodexHelperSingleQuotedPowerShellLiteral $m.Groups[1].Value) } } };`,
+		`function Get-CodexHelperBridgeTaskIdentity([string]$taskName) {
+    $identity = @{ Exe = ''; Args = ''; Script = ''; ScriptArgs = '' }
+    try {
+        $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($null -eq $task) { return $identity }
+        foreach ($action in @($task.Actions)) {
+            Set-CodexHelperCleanupExeCandidate $identity ([string]$action.Execute)
+            $arguments = [string]$action.Arguments
+            if ($arguments -match '^teams\s+(run|listen|service\s+watchdog)\s') { $identity['Args'] = $arguments }
+            Add-CodexHelperCleanupIdentity $identity $arguments
+            foreach ($m in [regex]::Matches($arguments, '(?i)(?:^|\s)(?:"([^"]+\.vbs)"|([^\s"]+\.vbs))(?=\s|$)')) {
+                $vbs = $m.Groups[1].Value + $m.Groups[2].Value
+                $ps1 = [IO.Path]::ChangeExtension($vbs, '.ps1')
+                if (-not (Test-Path -LiteralPath $ps1)) { continue }
+                $identity['Script'] = $ps1
+                $contents = Get-Content -LiteralPath $ps1 -Raw -ErrorAction SilentlyContinue
+                Add-CodexHelperCleanupIdentity $identity $contents
+                $argMatch = [regex]::Match($contents, ([regex]::Escape([string][char]36) + "argumentLine\s*=\s+'((?:''|[^'])*)'"), 'IgnoreCase')
+                if ($argMatch.Success) { $identity['ScriptArgs'] = Convert-CodexHelperSingleQuotedPowerShellLiteral $argMatch.Groups[1].Value }
+            }
+        }
+    } catch { }
+    return $identity
+};`,
 	}
 	return strings.Join(parts, " ") + " "
 }
