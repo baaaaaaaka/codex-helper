@@ -30,7 +30,7 @@ func runTeamsWindowsHandoffTestChild() {
 	if anchor == "" {
 		return
 	}
-	if filepath.Base(os.Args[0]) == "cxp.exe" {
+	if !strings.EqualFold(os.Args[0], os.Getenv("CXP_CI_WINDOWS_TEAMS_HANDOFF_RUNTIME")) {
 		// Native stable entries start a versioned child and wait for it.
 		child := exec.Command(os.Getenv("CXP_CI_WINDOWS_TEAMS_HANDOFF_RUNTIME"), os.Args[1:]...)
 		child.Stdout, child.Stderr = os.Stdout, os.Stderr
@@ -161,12 +161,12 @@ func TestTeamsServiceWindowsNativeScheduledRestartHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := filepath.Join(tmp, "cxp.exe")
-	child := filepath.Join(tmp, "versions", "v0.0.0", "codex-proxy.exe")
+	child := filepath.Join(tmp, ".cxp-runtime", "versions", "v0.0.0", "cxp.exe")
 	writeCLIFile(t, entry, string(bin), 0o700)
 	writeCLIFile(t, child, string(bin), 0o700)
 	anchor := filepath.Join(tmp, "core.sqlite")
 	spec := teamsServiceSpec{
-		Executable: entry, WorkingDir: tmp, WindowsTaskLauncherPath: filepath.Join(tmp, "bridge.vbs"),
+		Executable: entry, WorkingDir: tmp, WindowsTaskLauncherPath: filepath.Join(tmp, "launcher path", "bridge.vbs"),
 		Environment: map[string]string{
 			windowsHandoffFixtureAnchor:            anchor,
 			"CXP_CI_WINDOWS_TEAMS_HANDOFF_RUNTIME": child,

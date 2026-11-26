@@ -16,8 +16,10 @@ import (
 )
 
 func teamsServiceWindowsRestartPowerShell(task, watchdog string) string {
-	start := teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell() + teamsServiceWaitScheduledTaskStoppedFunctionPowerShell()
-	stop := "Stop-ScheduledTask -TaskName " + task + " -ErrorAction Stop; " + teamsServiceWindowsStopBridgeChildrenPowerShell(task) +
+	start := teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell() + teamsServiceWaitScheduledTaskStoppedFunctionPowerShell() +
+		teamsServiceWindowsBridgeIdentityPowerShell() + teamsServiceWindowsCaptureVersionedBridgePowerShell(task)
+	stop := "Stop-ScheduledTask -TaskName " + task + " -ErrorAction Stop; " +
+		teamsServiceWindowsStopCapturedBridgePowerShell + teamsServiceWindowsStopIdentifiedBridgePowerShell(task) +
 		"Enable-ScheduledTask -TaskName " + task + " -ErrorAction Stop | Out-Null; if (-not (Wait-CodexHelperScheduledTaskStopped " + task + " 20)) { throw 'Teams bridge Scheduled Task did not stop before restart' }; "
 	bridge := "Start-CodexHelperScheduledTaskIfStopped " + task
 	if watchdog == "" {
@@ -27,6 +29,68 @@ func teamsServiceWindowsRestartPowerShell(task, watchdog string) string {
 		"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName " + watchdog + " -ErrorAction Stop | Out-Null }; " + bridge +
 		"; if ($null -ne $watchdogTask) { Start-CodexHelperScheduledTaskIfStopped " + watchdog + " }"
 }
+
+// The installed VBS calls its PowerShell launcher, which starts the
+// stable entry. On Windows that entry waits for a versioned child. Record
+// the child while that lineage still exists: stopping the Scheduled Task
+// can remove the launcher or entry while leaving the bridge alive.
+func teamsServiceWindowsCaptureVersionedBridgePowerShell(task string) string {
+	return "$bridgeRuntimeIdentity = Get-CodexHelperBridgeTaskIdentity " + task + "; " + `
+$bridgeRuntimeProcesses = @()
+$bridgeRuntimeEntry = [string]$bridgeRuntimeIdentity['Exe']
+$bridgeRuntimeArgs = [string]$bridgeRuntimeIdentity['Args']
+$bridgeRuntimeScript = [string]$bridgeRuntimeIdentity['Script']
+if ($bridgeRuntimeEntry -and $bridgeRuntimeArgs -and $bridgeRuntimeScript) {
+    $versions = Join-Path ([IO.Path]::GetDirectoryName($bridgeRuntimeEntry)) '.cxp-runtime\versions'
+    $fileArgument = Convert-CodexHelperCommandForMatch ('-File "' + $bridgeRuntimeScript + '"')
+    $byPID = @{}
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    foreach ($process in $processes) { $byPID[[int]$process.ProcessId] = $process }
+    foreach ($runtime in $processes) {
+        $path = [string]$runtime.ExecutablePath
+        if (-not $path -or [IO.Path]::GetFileName($path) -ine 'cxp.exe') { continue }
+        $version = [IO.Path]::GetDirectoryName($path)
+        if ([IO.Path]::GetDirectoryName($version) -ine $versions) { continue }
+        if (-not (Test-CodexHelperTeamsBridgeCommand $runtime.CommandLine $bridgeRuntimeArgs)) { continue }
+        $entry = $byPID[[int]$runtime.ParentProcessId]
+        if ($null -eq $entry -or $entry.ExecutablePath -ine $bridgeRuntimeEntry -or $entry.CreationDate -gt $runtime.CreationDate) { continue }
+        if (-not (Test-CodexHelperTeamsBridgeCommand $entry.CommandLine $bridgeRuntimeArgs)) { continue }
+        $launcher = $byPID[[int]$entry.ParentProcessId]
+        if ($null -eq $launcher -or $launcher.Name -ine 'powershell.exe' -or $launcher.CreationDate -gt $entry.CreationDate) { continue }
+        $command = Convert-CodexHelperCommandForMatch $launcher.CommandLine
+        if ($command.IndexOf($fileArgument, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        $pinned = Get-Process -Id $runtime.ProcessId -ErrorAction SilentlyContinue
+        if ($null -eq $pinned) { continue }
+        try {
+            # Pin the kernel handle before stopping the task. A reused PID
+            # must never be mistaken for this task's bridge.
+            [void]$pinned.Handle
+            if ($pinned.Path -ieq $path -and [Math]::Abs(($pinned.StartTime.ToUniversalTime() - $runtime.CreationDate.ToUniversalTime()).TotalMilliseconds) -lt 1) {
+                $bridgeRuntimeProcesses += $pinned
+                $pinned = $null
+            }
+        } catch {
+            if (-not $pinned.HasExited) { throw "Cannot verify task-owned Teams runtime: $_" }
+        } finally {
+            if ($null -ne $pinned) { $pinned.Dispose() }
+        }
+    }
+}
+`
+}
+
+const teamsServiceWindowsStopCapturedBridgePowerShell = `
+foreach ($pinned in $bridgeRuntimeProcesses) {
+    try {
+        if (-not $pinned.HasExited) { $pinned.Kill() }
+        if (-not $pinned.WaitForExit(5000)) { throw "Task-owned Teams runtime pid $($pinned.Id) did not exit" }
+    } catch {
+        if (-not $pinned.HasExited) { throw }
+    } finally {
+        $pinned.Dispose()
+    }
+}
+`
 
 func restartTeamsWindowsService(ctx context.Context, out io.Writer, backend teamsServiceWindowsTaskBackend) error {
 	xmlPath, err := backend.Path()
