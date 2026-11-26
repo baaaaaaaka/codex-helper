@@ -138,7 +138,7 @@ func TestScheduledNativeWaitSuppressesHintsAndClearsOnCompletion(t *testing.T) {
 	r.ag.block["ordinary silence"] = make(chan struct{})
 	r.ag.mu.Unlock()
 	r.ch.PostUser(work, "ordinary silence")
-	r.wait("ordinary silence behavior", func() bool { return len(r.own(work, "Still working")) >= 1 })
+	r.wait("ordinary silence behavior", func() bool { return len(r.own(work, "Still working")) > earlyWorking })
 	r.ch.PostUser(work, "helper cancel running")
 	r.wait("second cancel", func() bool { return len(r.own(work, "Codex request canceled.")) == 2 })
 }
