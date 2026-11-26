@@ -185,7 +185,11 @@ func TestTeamsServiceWindowsNativeScheduledRestartHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	xml := writeProbeScript(t, tmp, "task.xml", buildTeamsServiceWindowsTaskXMLWithPrincipalUser(spec, principal.Uid))
+	// Scope the temporary task's trigger to this user so the fixture
+	// also runs under a standard Windows account.
+	taskXML := buildTeamsServiceWindowsTaskXMLWithPrincipalUser(spec, principal.Uid)
+	taskXML = strings.Replace(taskXML, "    </LogonTrigger>", "      <UserId>"+xmlEscape(principal.Uid)+"</UserId>\n    </LogonTrigger>", 1)
+	xml := writeProbeScript(t, tmp, "task.xml", taskXML)
 	task := powershellSingleQuote("Codex Helper CI isolated Teams handoff " + filepath.Base(tmp) + fmt.Sprint(os.Getpid(), "-", time.Now().UnixNano()))
 	if out, err := teamsServiceRunPowerShell(ctx, "$xml = Get-Content -LiteralPath "+powershellSingleQuote(xml)+" -Raw; Register-ScheduledTask -TaskName "+task+" -Xml $xml -ErrorAction Stop | Out-Null"); err != nil {
 		t.Fatalf("register fixture task: %v\n%s", err, out)
